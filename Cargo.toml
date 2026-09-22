@@ -1,0 +1,59 @@
+[package]
+name = "qi-bunny"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "奇小兔(qi-bunny)—— AI 智能体开发辅助工具:开源库的搜索与更新加速"
+
+# GitHub 网络加速命令行工具(仅用于辅助软件开发、学习使用)
+# 机制:hosts 加速(HTTPS)+ SSH 本地转发(代码库管理)
+# 结构:共享逻辑在 src/lib.rs,两个独立二进制彻底分离托盘与命令行模式:
+#   dns.rs            <- DoH/UDP 双路域名解析
+#   hosts.rs          <- hosts 标记块托管
+#   probe.rs          <- 真实 TLS 握手测速择优
+#   sources.rs        <- 多通道候选 IP 采集
+#   ssh.rs            <- 代码库管理模式(SSH 转发)
+#   tray.rs           <- 托盘后台模式(图标即状态)
+#   bin/qi_bunny.rs     托盘入口(GUI 子系统,从启动起无控制台窗口,不闪黑窗)
+#   bin/qi_bunny_cli.rs 命令行入口(cli/git/clean,控制台子系统)
+
+[lib]
+name = "qi_bunny"
+path = "src/lib.rs"
+
+# 托盘后台模式(GUI 子系统):双击/开机启动用,无任何窗口
+[[bin]]
+name = "qi-bunny"
+path = "src/bin/qi_bunny.rs"
+
+# 命令行模式(控制台子系统):命令窗口手动执行用
+[[bin]]
+name = "qi-bunny-cli"
+path = "src/bin/qi_bunny_cli.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+ctrlc = "3"
+# probe.rs 真实 TLS 测速用(ring 后端避免 aws-lc-rs 的 cmake 依赖)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+# cert.rs 本地 CA 生成与按域名动态签发叶子证书(MITM 加速模式)
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# 托盘后台模式
+tray-icon = "0.19"          # 托盘图标/菜单
+tao = "0.30"                # 事件循环(托盘菜单事件泵)
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Threading",  # CreateMutexW 单实例互斥锁
+    "Win32_Foundation",        # HANDLE / ERROR_ALREADY_EXISTS
+    "Win32_Security",          # CreateMutexW 的 SECURITY_ATTRIBUTES 参数
+] }
+# GitHub logo(SVG)渲染为托盘图标
+resvg = "0.42"
+
+[profile.release]
+opt-level = "z"     # 体积优先优化
+lto = "fat"         # 全程序 LTO,跨 crate 内联裁剪
+codegen-units = 1   # 单编译单元,最大化消除冗余
+panic = "abort"     # 去掉 unwind 表(托盘/CLI 均无需捕获 panic)
+strip = "symbols"   # 剥离符号表
