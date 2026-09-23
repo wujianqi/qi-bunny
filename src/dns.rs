@@ -7,11 +7,17 @@
 //! 所有候选交由 probe.rs 做真实连通性测速后择优。
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv6Addr;
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 简短互斥锁封装(与 proxy.rs 同款约定)
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// DoH 端点(DNSPod/Ali/360/Google,加密 DNS):多源并行,单一源返回的
 /// 污染/陈旧 IP 会被其他源的可信记录稀释,探测层再兜底过滤
@@ -35,7 +41,39 @@ const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 
 /// 向全部 DoH 端点 + UDP DNS 并行查询,收集该域名所有 A/AAAA 候选 IP(去重)。
+/// 结果按域名缓存(TTL 对齐 Watt 的 DoH 缓存 ~10 分钟):探测/补池频繁触发
+/// 解析,缓存命中时零网络成本——重探可以更频繁,坏 IP 换血更快。
 pub fn candidates(domain: &str) -> Vec<String> {
+    // 缓存命中(未过期)直接返回
+    {
+        let cache = lock(cache());
+        if let Some((at, ips)) = cache.get(domain) {
+            if at.elapsed() < CACHE_TTL {
+                return ips.clone();
+            }
+        }
+    }
+    let fresh = resolve_all(domain);
+    if !fresh.is_empty() {
+        lock(cache()).insert(domain.to_string(), (Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+/// 解析结果缓存:域名 → (采集时刻, IP 列表)。空结果不缓存(全挂时下轮重试)
+type DnsCache = HashMap<String, (Instant, Vec<String>)>;
+
+fn cache() -> &'static Mutex<DnsCache> {
+    static S: OnceLock<Mutex<DnsCache>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 缓存 TTL:与 Watt 的 DoH 缓存(9.9 分钟)同级;GitHub A 记录 TTL 通常
+/// 60s 级,但候选池本就靠探测验证可用性,稍长的解析缓存不影响正确性
+const CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// 实际解析:全部 DoH + UDP DNS 并行查询,去重收集
+fn resolve_all(domain: &str) -> Vec<String> {
     let (tx, rx) = mpsc::channel::<String>();
     for ep in DOH_ENDPOINTS {
         for qtype in [TYPE_A, TYPE_AAAA] {

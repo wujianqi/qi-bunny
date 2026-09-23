@@ -14,8 +14,9 @@ use crate::{log, logerr};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 /// 本机监听端口:HTTPS 流量(Hosts 指向)与 HTTP 流量(保持 http:// 链接可用)
@@ -37,11 +38,45 @@ const MIN_HEALTHY: usize = 4;
 // ---------- 候选池存储 ----------
 
 /// 单个上游候选:IP + 失败分(运行期连接失败累计)+ 最近探测延迟
+/// + 试用标记(应急快速通道入池,尚未被真实转发验证)
+/// + 真实流量 EWMA 记分(成功率 0..1000,延迟 ms)
 #[derive(Debug, Clone)]
 struct Cand {
     ip: String,
     fails: u32,
     latency_ms: u128,
+    /// true = 应急入池的试用 IP:1 轮探测通过即并入(池深≤1 时的快速通道);
+    /// 真实转发成功即转正,失败立即踢出。正常合并的候选恒为 false
+    probation: bool,
+    /// 真实转发成功率的 EWMA(0=全失败,1000=全成功);None=尚无真实流量
+    /// 样本(此时按探测延迟排序)。新样本权重 α=0.3
+    ewma_ok: Option<u32>,
+    /// 真实转发耗时的 EWMA(ms,含连接+响应头);None=尚无样本
+    ewma_ms: Option<u128>,
+    /// 熔断窗口内的最近失败时刻(时间窗口计数:窗口内连续失败达阈值
+    /// 即时踢出,不等探测周期)——成功会清空计数,瞬时抖动不误伤
+    recent_fails: Vec<Instant>,
+}
+
+/// EWMA 新样本权重:越小越平滑(历史占比越高),0.3 约等于近 3-4 次
+/// 请求主导评分——单次抖动不翻转排序,连续劣化 3 次内沉底
+const EWMA_ALPHA_NUM: u32 = 3;
+const EWMA_ALPHA_DEN: u32 = 10;
+
+/// 用新样本更新候选的 EWMA 记分(成功 s=true 时 ok=1000,失败 ok=0)
+fn ewma_update(c: &mut Cand, s: bool, elapsed_ms: u128) {
+    let ok_new: u32 = if s { 1000 } else { 0 };
+    match (c.ewma_ok, c.ewma_ms) {
+        (Some(ok), Some(ms)) => {
+            c.ewma_ok = Some((ok * (EWMA_ALPHA_DEN - EWMA_ALPHA_NUM) + ok_new * EWMA_ALPHA_NUM) / EWMA_ALPHA_DEN);
+            c.ewma_ms = Some((ms * (EWMA_ALPHA_DEN - EWMA_ALPHA_NUM) as u128 + elapsed_ms * EWMA_ALPHA_NUM as u128) / EWMA_ALPHA_DEN as u128);
+        }
+        // 首个样本:直接采用(不与假想的 500 中立值混合)
+        _ => {
+            c.ewma_ok = Some(ok_new);
+            c.ewma_ms = Some(elapsed_ms);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -451,8 +486,10 @@ fn forward_request(req: &PlainRequest) -> Vec<u8> {
         }) else {
             break; // 池空或全部已试过,走兜底
         };
+        let t0 = Instant::now();
         match send_request_to_ip(&ip, domain, https, req) {
             Ok(resp) => {
+                let elapsed = t0.elapsed().as_millis();
                 // 拦截页特征(200 伪装)同样换 IP 重试:这是"Access to this
                 // site has been restricted"在转发层的最后防线
                 if is_block_page(&resp) {
@@ -465,13 +502,18 @@ fn forward_request(req: &PlainRequest) -> Vec<u8> {
                 // ConnectCallback 的"坏出口即换"策略);全部候选都 5xx
                 // 才把最后的响应交给客户端
                 if is_upstream_5xx(&resp) && last_resp.is_empty() {
+                    record_sample(domain, &ip, false, elapsed);
                     mark_fail(domain, &ip);
                     last_resp = resp;
                     continue;
                 }
+                // 真实转发成功:试用 IP 在此转正,健康候选失败分清零
+                record_sample(domain, &ip, true, elapsed);
+                mark_success(domain, &ip);
                 return resp;
             }
             Err(e) => {
+                record_sample(domain, &ip, false, t0.elapsed().as_millis());
                 mark_fail(domain, &ip);
                 logerr!("[*] {} 上游 {} 转发失败({}),换下一个候选", domain, ip, e);
             }
@@ -501,36 +543,84 @@ fn send_request_to_ip(
     https: bool,
     req: &PlainRequest,
 ) -> Result<Vec<u8>, String> {
-    let port = if https { 443 } else { 80 };
-    let addr = format!("{}:{}", ip, port)
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or("bad ip")?;
-    let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT)
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_nodelay(true)
-        .ok();
-    stream
-        .set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT))
-        .ok();
-    stream
-        .set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT))
-        .ok();
-
-    let head = if https {
-        // 上游 TLS:webpki 根证书校验真 GitHub 证书,域名取 Host 头
-        let server_name =
-            rustls::pki_types::ServerName::try_from(domain.to_string()).map_err(|e| e.to_string())?;
-        let mut conn = rustls::ClientConnection::new(crate::probe::tls_config_pub(), server_name)
-            .map_err(|e| e.to_string())?;
-        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-        write_and_read_response(&mut tls, req)
+    if https {
+        // 暖连接优先:LIFO 借用最新入池者(最可能还活着),keep-alive 发送。
+        // 暖连接已死(被上游/中间设备关闭)在此静默降级冷连——错误不外抛,
+        // 避免转发层把"连接池陈旧"误记成该 IP 故障
+        if let Some(mut warm) = warm_take(domain, ip) {
+            match write_and_read_reusable(&mut warm.tls, req) {
+                Ok((resp, true)) => {
+                    warm_put(domain, ip, warm.tls);
+                    return Ok(resp);
+                }
+                Ok((resp, false)) => return Ok(resp), // close 语义响应,连接用完即弃
+                Err(_) => {
+                    warm_evict_idle(); // 死连接顺手清理,继续走冷连
+                }
+            }
+        }
+        // 冷连:握手后也用 keep-alive,响应按分帧收齐则连接入池复用
+        let mut tls = tls_connect(domain, ip)?;
+        match write_and_read_reusable(&mut tls, req) {
+            Ok((resp, true)) => {
+                warm_put(domain, ip, tls);
+                Ok(resp)
+            }
+            Ok((resp, false)) => Ok(resp),
+            Err(e) => Err(e),
+        }
     } else {
+        // 80 端口保持旧行为:直连 + close 语义
+        let addr = format!("{}:{}", ip, 80)
+            .to_socket_addrs()
+            .map_err(|e| e.to_string())?
+            .next()
+            .ok_or("bad ip")?;
+        let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
         write_and_read_response(&mut stream, req)
-    };
-    head
+    }
+}
+
+/// keep-alive 版请求读写:发请求(保留上游连接)并读完整响应;
+/// 返回 (响应, 连接是否可复用)——仅当响应按 Content-Length/chunked
+/// 分帧收齐时可复用(close 语义/读满 EOF 的响应无法保证流位置对齐)。
+fn write_and_read_reusable<S: Read + Write>(
+    stream: &mut S,
+    req: &PlainRequest,
+) -> Result<(Vec<u8>, bool), String> {
+    // 重建请求头:与 close 版一致,仅 Connection 换成 keep-alive
+    let mut out = Vec::with_capacity(req.head.len() + req.body.len() + 64);
+    let head_text = String::from_utf8_lossy(&req.head);
+    let mut first = true;
+    for line in head_text.lines() {
+        if first {
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            first = false;
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if line.is_empty() || lower.starts_with("host:") || lower.starts_with("connection:") || lower.starts_with("keep-alive:") {
+            continue;
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Host: {}\r\n", req.domain).as_bytes());
+    out.extend_from_slice(b"Connection: keep-alive\r\n");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&req.body);
+
+    stream
+        .write_all(&out)
+        .map_err(|e| format!("发送请求失败:{}", e))?;
+
+    let (resp, framed) = read_full_response_framed(stream)?;
+    Ok((resp, framed))
 }
 
 /// 组装转发请求(重写 Host 与 Connection,带体)并读完整响应
@@ -624,6 +714,58 @@ fn read_full_response<S: Read>(stream: &mut S) -> Result<Vec<u8>, String> {
     Ok(resp)
 }
 
+/// 读完整响应并判定连接可否复用(keep-alive):按 Content-Length/chunked
+/// 分帧收齐 → (响应, true);靠 EOF 才收齐(close 语义)→ (响应, false)。
+/// 内部逻辑与 read_full_response 相同,仅额外追踪分帧终止是否命中。
+fn read_full_response_framed<S: Read>(stream: &mut S) -> Result<(Vec<u8>, bool), String> {
+    let mut resp = Vec::with_capacity(16 * 1024);
+    let mut buf = [0u8; 16 * 1024];
+    let mut head_end: Option<usize> = None;
+    let mut framed_end = false;
+    loop {
+        if let Some(pos) = head_end {
+            let head = String::from_utf8_lossy(&resp[..pos]);
+            let lower = head.to_ascii_lowercase();
+            if let Some(cl) = extract_header(&lower, "content-length:")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                if resp.len() >= pos + 4 + cl {
+                    framed_end = true;
+                    break;
+                }
+            } else if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+                if resp.ends_with(b"0\r\n\r\n") {
+                    framed_end = true;
+                    break;
+                }
+            }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break, // EOF:close 语义,不可复用
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                if head_end.is_none() {
+                    head_end = find_head_end(&resp);
+                }
+                if resp.len() > 32 * 1024 * 1024 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                if head_end.is_none() {
+                    return Err("上游响应超时".into());
+                }
+                break;
+            }
+            Err(e) => return Err(format!("读响应失败:{}", e)),
+        }
+    }
+    if resp.is_empty() {
+        return Err("上游 0 字节响应".into());
+    }
+    Ok((resp, framed_end))
+}
+
 /// 从(已小写的)响应头文本里取指定头的值
 fn extract_header(lower_head: &str, name: &str) -> Option<String> {
     lower_head.lines().find_map(|l| {
@@ -674,13 +816,184 @@ const SPREAD_WINDOW: usize = 3;
 /// 连接级轮询计数器:每次选路 +1,实现候选间的负载打散
 static PICK_TICK: AtomicUsize = AtomicUsize::new(0);
 
-/// 从健康池选上游:健康候选(fails==0)按探测延迟升序,在前 SPREAD_WINDOW
-/// 个最优者中轮询打散;全部不健康时回退取失败分最低者(给劣化 IP 恢复机会)。
+// ---------- 上游暖连接池(按 domain+ip 索引的 TLS 长连接) ----------
+
+/// 单条暖连接:已握手的 TLS 流(owns TCP + ClientConnection)+ 入池时刻
+struct WarmConn {
+    tls: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    born: Instant,
+}
+
+/// 暖池:键 = (domain, ip),值 = 该上游的空闲长连接列表(LIFO 复用)
+fn warm_pool() -> &'static Mutex<HashMap<(String, String), Vec<WarmConn>>> {
+    static S: OnceLock<Mutex<HashMap<(String, String), Vec<WarmConn>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 每个上游最多缓存的空闲连接数(对齐 Watt HTTP/2 多路复用的并发承载:
+/// HTTP/1.1 一连接一请求,浏览器打开页面数十并发,3 条暖池瞬间耗尽即排队
+/// 超时被计为失败——扩到 8 条缓解高并发瓶颈)
+const WARM_MAX_PER_KEY: usize = 8;
+/// 空闲连接的最长保留时间:GitHub/中间设备的 keep-alive 超时通常 60s 级,
+/// 超过即淘汰(复用一条已被上游关掉的连接只会白白失败一次)
+const WARM_MAX_IDLE: Duration = Duration::from_secs(50);
+/// 全局暖池连接总数上限(8 域名 × 8 已够用,防失控)
+const WARM_MAX_TOTAL: usize = 64;
+
+/// 归还一条可复用连接(LIFO,超限/超总容量则丢最旧的)
+fn warm_put(domain: &str, ip: &str, tls: rustls::StreamOwned<rustls::ClientConnection, TcpStream>) {
+    let mut pool = lock(warm_pool());
+    let key = (domain.to_string(), ip.to_string());
+    let list = pool.entry(key).or_default();
+    list.push(WarmConn { tls, born: Instant::now() });
+    // 容量修剪:单键超限丢最旧;全局超限按入池时间淘汰最旧
+    if list.len() > WARM_MAX_PER_KEY {
+        list.remove(0);
+    }
+    let total: usize = pool.values().map(|v| v.len()).sum();
+    if total > WARM_MAX_TOTAL {
+        let mut all: Vec<((String, String), Instant)> = pool
+            .iter()
+            .flat_map(|(k, v)| v.iter().map(move |w| (k.clone(), w.born)))
+            .collect();
+        all.sort_by_key(|(_, b)| *b);
+        let excess = total - WARM_MAX_TOTAL;
+        for (key, _) in all.into_iter().take(excess) {
+            if let Some(v) = pool.get_mut(&key) {
+                v.remove(0);
+            }
+        }
+    }
+}
+
+/// 借走一条暖连接(LIFO:最新入池的最可能还活着)
+fn warm_take(domain: &str, ip: &str) -> Option<WarmConn> {
+    let mut pool = lock(warm_pool());
+    pool.get_mut(&(domain.to_string(), ip.to_string()))?.pop()
+}
+
+/// 淘汰过期暖连接(空闲超时);返回清理的条数
+fn warm_evict_idle() -> usize {
+    let mut pool = lock(warm_pool());
+    let mut removed = 0;
+    for v in pool.values_mut() {
+        let before = v.len();
+        v.retain(|w| w.born.elapsed() < WARM_MAX_IDLE);
+        removed += before - v.len();
+    }
+    pool.retain(|_, v| !v.is_empty());
+    removed
+}
+
+/// 后台暖池维护:淘汰过期连接 + 为健康 IP 预热(每域名给延迟最优的前
+/// 2 个 IP 各保 1 条暖连接,请求到来时零握手直接发)
+fn warm_maintain(domains: &[String]) {
+    warm_evict_idle();
+    for d in domains {
+        // 取当前延迟最优的前 2 个健康 IP
+        let ips: Vec<String> = {
+            let s = lock(store());
+            let mut h: Vec<&Cand> = s.pools.get(d).map(|v| v.iter().filter(|c| c.fails == 0).collect()).unwrap_or_default();
+            h.sort_by_key(|c| c.latency_ms);
+            h.iter().take(2).map(|c| c.ip.clone()).collect()
+        };
+        for ip in ips {
+            // 该上游已有暖连接则跳过(预热的目的是"至少 1 条在手")
+            let has = lock(warm_pool()).contains_key(&(d.to_string(), ip.clone()));
+            if has {
+                continue;
+            }
+            // 后台静默握手:失败不打扰主流程(说明该 IP 当前连不通,
+            // 由转发失败/探测路径负责处理)
+            if let Ok(tls) = tls_connect(d, &ip) {
+                warm_put(d, &ip, tls);
+            }
+        }
+    }
+}
+
+/// SNI 随机化(对齐 Watt WithRandom):GitHub 系域名证书均为通配符
+/// (*.github.com / *.githubusercontent.com),在主机名最左侧加随机标签,
+/// 证书校验依然通过,但 DPI 无法按 SNI 精确匹配发 RST。
+/// 探测路径(probe.rs)必须用真实域名(它是"能否服务用户"的判定),
+/// 仅转发路径(tls_connect)做伪装。
+fn sni_disguise(domain: &str) -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut label = String::with_capacity(8);
+    for _ in 0..8 {
+        label.push(CHARS[fastrand_idx()] as char);
+    }
+    format!("{}.{}", label, domain)
+}
+
+/// 轻量伪随机(无需额外依赖:进程内原子计数 + 混淆)
+fn fastrand_idx() -> usize {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut x = t.wrapping_mul(0x9E3779B97F4A7C15) ^ std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    (x % 36) as usize
+}
+
+/// 对上游建立 TLS 连接(握手完成),供暖池预热与冷连路径共用。
+/// SNI 伪装优先(随机子域),握手被 RST 时回退真实域名重试一次——
+/// 通配符证书使两种 SNI 都能通过 webpki 校验。
+fn tls_connect(domain: &str, ip: &str) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, String> {
+    let addr = format!("{}:{}", ip, 443)
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or("bad ip")?;
+    let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
+
+    // 伪装 SNI 握手:先在裸流上 complete_io 驱动完整握手,失败(典型为
+    // RST)即回退真实域名 SNI 重试同一连接
+    if let Ok(sni) = rustls::pki_types::ServerName::try_from(sni_disguise(domain)) {
+        if let Ok(mut conn) = rustls::ClientConnection::new(crate::probe::tls_config_pub(), sni) {
+            if conn.complete_io(&mut stream).is_ok() {
+                return Ok(rustls::StreamOwned::new(conn, stream));
+            }
+        }
+    }
+    // 回退:真实域名 SNI(部分上游不接受陌生子域时的保底)
+    let server_name = rustls::pki_types::ServerName::try_from(domain.to_string()).map_err(|e| e.to_string())?;
+    let mut conn = rustls::ClientConnection::new(crate::probe::tls_config_pub(), server_name)
+        .map_err(|e| e.to_string())?;
+    conn.complete_io(&mut stream).map_err(|e| e.to_string())?;
+    Ok(rustls::StreamOwned::new(conn, stream))
+}
+
+
+/// 如已被踢出后才返回的迟到结果)
+fn record_sample(domain: &str, ip: &str, ok: bool, elapsed_ms: u128) {
+    let mut s = lock(store());
+    if let Some(pool) = s.pools.get_mut(domain) {
+        if let Some(c) = pool.iter_mut().find(|c| c.ip == ip) {
+            ewma_update(c, ok, elapsed_ms);
+        }
+    }
+}
+
+/// 从健康池选上游:有真实流量样本(EWMA)的候选按"成功率降序、耗时升序"
+/// 排,无样本的新候选按探测延迟排并插在 EWMA 全绿者之后——真实流量是
+/// "现在通"的证据,优先级高于探测延迟这种陈旧数据;健康池空时回退取
+/// 失败分最低者(给劣化 IP 恢复机会)。
 fn pick_upstream(domain: &str) -> Option<String> {
     let s = lock(store());
     let pool = s.pools.get(domain)?;
     let mut healthy: Vec<&Cand> = pool.iter().filter(|c| c.fails == 0).collect();
-    healthy.sort_by_key(|c| c.latency_ms);
+    healthy.sort_by(|a, b| {
+        let key = |c: &Cand| (c.ewma_ok.unwrap_or(1000), Reverse(c.ewma_ms.unwrap_or(u128::MAX)));
+        key(b).cmp(&key(a)).then_with(|| c0_lat(a).cmp(&c0_lat(b)))
+    });
     let chosen = if healthy.is_empty() {
         pool.iter().min_by_key(|c| c.fails)
     } else {
@@ -691,25 +1004,72 @@ fn pick_upstream(domain: &str) -> Option<String> {
     chosen.map(|c| c.ip.clone())
 }
 
-/// 记录上游连接失败:失败分 +1,达到阈值踢出候选
+/// 无样本候选的排序键(探测延迟);有样本者返回 0 保证排在其 EWMA 组内
+fn c0_lat(c: &Cand) -> u128 {
+    if c.ewma_ok.is_none() { c.latency_ms } else { 0 }
+}
+
+/// 失败事件通知:mark_fail 通过它唤醒 standby 线程立即补池(事件驱动,
+/// 平时主池健康则 standby 完全静默,零探测流量)
+fn fail_event() -> &'static (Mutex<Vec<String>>, Condvar) {
+    static S: OnceLock<(Mutex<Vec<String>>, Condvar)> = OnceLock::new();
+    S.get_or_init(|| (Mutex::new(Vec::new()), Condvar::new()))
+}
+
+/// 熔断时间窗口:窗口内的失败才累计,超窗自动清零(瞬时抖动不误伤)
+const TRIP_WINDOW: Duration = Duration::from_secs(60);
+/// 窗口内失败达到该次数即熔断踢出(不等探测周期/FAIL_KICK)
+const TRIP_THRESHOLD: usize = 3;
+
+/// 记录上游连接失败:失败分 +1,达到阈值踢出候选;试用 IP(应急快速通道
+/// 入池、未经完整确认)失败一次立即踢出——试用资格由真实转发严格检验;
+/// 熔断窗口(60s 内 3 败)内连续失败的 IP 即时踢出,不等探测周期——
+/// 坏 IP 的失败代价从"最多 FAIL_KICK 次转发"压到窗口阈值;
+/// 同时通知 standby 线程该域名需要紧急补池(只入队不等待,转发路径零阻塞)
 fn mark_fail(domain: &str, ip: &str) {
     let mut s = lock(store());
     if let Some(pool) = s.pools.get_mut(domain) {
         if let Some(c) = pool.iter_mut().find(|c| c.ip == ip) {
+            if c.probation {
+                // 试用 IP:真实转发失败即证明验证不足,立即出局,不给第二次
+                pool.retain(|c| c.ip != ip);
+                drop(s);
+                let (q, cv) = fail_event();
+                let mut q = lock(q);
+                if !q.iter().any(|d| d == domain) {
+                    q.push(domain.to_string());
+                }
+                cv.notify_all();
+                return;
+            }
             c.fails = c.fails.saturating_add(1);
+            // 时间窗口熔断:只保留窗口内失败时刻,达阈值即出局
+            let now = Instant::now();
+            c.recent_fails.retain(|t| now.duration_since(*t) < TRIP_WINDOW);
+            c.recent_fails.push(now);
         }
-        pool.retain(|c| c.fails < FAIL_KICK);
+        pool.retain(|c| c.fails < FAIL_KICK && c.recent_fails.len() < TRIP_THRESHOLD);
     }
+    drop(s);
+    // 事件驱动补池:去重入队,唤醒 standby
+    let (q, cv) = fail_event();
+    let mut q = lock(q);
+    if !q.iter().any(|d| d == domain) {
+        q.push(domain.to_string());
+    }
+    cv.notify_all();
 }
 
-/// 记录上游连接成功:失败分清零——比衰减更直接,转发成功即证明当前可用,
-/// 让被瞬时抖动误伤的候选立即回到健康轮询窗口
-#[allow(dead_code)]
-fn decay_fail(domain: &str, ip: &str) {
+/// 记录上游转发成功:试用 IP 转正(真实流量验证通过),健康候选失败分清零
+/// ——比衰减更直接,转发成功即证明当前可用,让被瞬时抖动误伤的候选
+/// 立即回到健康轮询窗口
+fn mark_success(domain: &str, ip: &str) {
     let mut s = lock(store());
     if let Some(pool) = s.pools.get_mut(domain) {
         if let Some(c) = pool.iter_mut().find(|c| c.ip == ip) {
+            c.probation = false;
             c.fails = 0;
+            c.recent_fails.clear();
         }
     }
 }
@@ -740,6 +1100,10 @@ fn refresh_pool(domain: &str) -> Vec<Cand> {
             ip: pool[p.ip_index].clone(),
             fails: 0,
             latency_ms: p.elapsed_ms,
+            probation: false,
+            ewma_ok: None,
+            ewma_ms: None,
+            recent_fails: Vec::new(),
         })
         .collect();
     cands.sort_by_key(|c| c.latency_ms);
@@ -881,6 +1245,10 @@ fn prober_loop(domains: Vec<String>) {
                         ip: ips[p.ip_index].clone(),
                         fails: 0,
                         latency_ms: p.elapsed_ms,
+                        probation: false,
+                        ewma_ok: None,
+                        ewma_ms: None,
+                        recent_fails: Vec::new(),
                     })
                     .collect();
                 cands.sort_by_key(|c| c.latency_ms);
@@ -892,6 +1260,9 @@ fn prober_loop(domains: Vec<String>) {
             }
             lock(in_progress()).remove(d);
         }
+        // 暖池维护(每轮):淘汰空闲超时连接,为各域名延迟最优的健康 IP
+        // 预热连接——请求到来时零握手直发,单 IP 死亡时切换也是毫秒级
+        warm_maintain(&domains);
     }
 }
 
@@ -961,18 +1332,27 @@ fn standby_scan(domain: &str) {
     entry.sort_by_key(|st| st.latency_ms);
 }
 
-/// 把 standby 里验证充分(连续 STANDBY_CONFIRM_ROUNDS 轮通过)的 IP 并入主池。
-/// 只做"追加":现有主池条目(含健康节点)一律不改动、不重排、不清零——
-/// 正在服务的稳定连接不受影响;新 IP 以 fails=0 加入,由 pick_upstream 的
-/// 轮询打散自然分流量。
+/// 把 standby 里验证充分的 IP 并入主池,按池深分档:
+/// - 池深 > 1:只合并连续 STANDBY_CONFIRM_ROUNDS 轮通过的候选(稳态标准)
+/// - 池深 ≤ 1(应急):1 轮探测通过即临时并入,标 probation,由真实转发
+///   验证——成功转正,失败立即踢出。最坏恢复时间从"2 轮确认"的分钟级
+///   压到一次采集+探测的十几秒级
+/// 合并仍是"追加":现有主池条目(含健康节点)一律不改动、不重排、不清零。
 fn promote_standby(domain: &str) -> usize {
+    // 应急判定:主池健康候选 ≤ 1 时启用快速通道
+    let urgent = {
+        let s = lock(store());
+        s.pools
+            .get(domain)
+            .map(|v| v.iter().filter(|c| c.fails == 0).count() <= 1)
+            .unwrap_or(true)
+    };
+    let need = if urgent { 1 } else { STANDBY_CONFIRM_ROUNDS };
     let ready: Vec<Standby> = {
         let mut sb = lock(standby_store());
         match sb.get_mut(domain) {
             Some(entry) => {
-                let (ready, rest): (Vec<_>, Vec<_>) = entry
-                    .drain(..)
-                    .partition(|st| st.confirm >= STANDBY_CONFIRM_ROUNDS);
+                let (ready, rest): (Vec<_>, Vec<_>) = entry.drain(..).partition(|st| st.confirm >= need);
                 *entry = rest;
                 ready
             }
@@ -989,36 +1369,69 @@ fn promote_standby(domain: &str) -> usize {
         if pool.iter().any(|c| c.ip == st.ip) {
             continue; // 已在主池(可能在扫描间隙被其他路径加入)
         }
-        pool.push(Cand { ip: st.ip.clone(), fails: 0, latency_ms: st.latency_ms });
+        pool.push(Cand {
+            ip: st.ip.clone(),
+            fails: 0,
+            latency_ms: st.latency_ms,
+            // 仅应急通道入池的是试用 IP;稳态合并走完整确认,无需试用
+            probation: urgent,
+            ewma_ok: None,
+            ewma_ms: None,
+            recent_fails: Vec::new(),
+        });
         promoted += 1;
     }
     pool.sort_by_key(|c| c.latency_ms);
     promoted
 }
 
-/// Standby 后台线程主循环:每域名轮流扫描,验证充分者并入主池。
+/// Standby 后台线程主循环(事件驱动):
+/// - mark_fail 的失败事件会唤醒本线程,只对失败域名立即采集+探测补池,
+///   平时主池健康则完全静默——零探测流量,不向网络暴露批量探测特征;
+/// - 无事件时低频兜底扫描全部域名(防"从未有流量"的域名候选陈旧)。
 /// 与 prober_loop 完全独立:主池的探测/刷新/踢出逻辑不受影响。
 fn standby_loop(domains: Vec<String>) {
     // 首轮等一等:让主池先把首轮探测做完,避免启动时与 prober 抢采集带宽
     thread::sleep(Duration::from_secs(10));
+    let (q, cv) = fail_event();
+    let mut pending: Vec<String> = domains.clone(); // 兜底:首轮全量扫一遍
     while RUNNING.load(Ordering::SeqCst) {
-        for d in &domains {
+        // 等待失败事件;无事件则按兜底周期超时醒来做低频全量扫描
+        {
+            let mut queue = lock(q);
+            if queue.is_empty() && pending.is_empty() {
+                let (waited, _) = cv.wait_timeout(queue, STANDBY_INTERVAL).unwrap_or_else(|poisoned| {
+                    // 锁中毒时取回内部队列继续用(只保护内存缓存,数据仍自洽)
+                    poisoned.into_inner()
+                });
+                queue = waited;
+            }
+            // 取走本轮要处理的域名(失败事件优先;无事件时兜底全量)
+            if !queue.is_empty() {
+                pending = std::mem::take(&mut *queue);
+            } else if pending.is_empty() {
+                pending = domains.clone();
+            }
+        }
+        for d in &pending {
             if !RUNNING.load(Ordering::SeqCst) {
                 break;
+            }
+            // 防重叠:prober 正在刷新该域名时跳过(避免采集/探测互相挤兑)
+            {
+                let mut ip = lock(in_progress());
+                if !ip.insert(d.clone()) {
+                    continue;
+                }
             }
             standby_scan(d);
             let n = promote_standby(d);
             if n > 0 {
                 log!("[*] {} standby 补充 {} 个已验证候选(现役 IP 未受影响)", d, n);
             }
+            lock(in_progress()).remove(d);
         }
-        // 分段休眠,保证 stop() 能及时退出
-        let mut waited = Duration::ZERO;
-        while waited < STANDBY_INTERVAL && RUNNING.load(Ordering::SeqCst) {
-            let step = Duration::from_secs(2).min(STANDBY_INTERVAL - waited);
-            thread::sleep(step);
-            waited += step;
-        }
+        pending.clear();
     }
 }
 
