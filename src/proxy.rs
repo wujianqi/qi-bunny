@@ -127,7 +127,10 @@ pub fn start(domains: &[String]) -> Result<(), String> {
 
     // 后台探测线程:立即做第一轮全量探测,之后周期维护
     let domains: Vec<String> = domains.to_vec();
-    thread::spawn(move || prober_loop(domains));
+    let d1 = domains.clone();
+    thread::spawn(move || prober_loop(d1));
+    // Standby 刷选线程:独立于主池持续采集验证候选,只做单向合并
+    thread::spawn(move || standby_loop(domains));
 
     log!("[+] 本机反代已启动(127.0.0.1:{}/{}),后台探测运行中", HTTPS_PORT, HTTP_PORT);
     Ok(())
@@ -888,6 +891,133 @@ fn prober_loop(domains: Vec<String>) {
                 }
             }
             lock(in_progress()).remove(d);
+        }
+    }
+}
+
+// ---------- Standby 刷选:独立于主池的后台持续采集 ----------
+
+/// Standby 扫描周期:持续刷候选的节奏(独立线程,不与主池探测争预算)
+const STANDBY_INTERVAL: Duration = Duration::from_secs(90);
+/// 单个 standby IP 的重复验证通过次数:连续 N 轮探测都成功才可合并入主池,
+/// 过滤"瞬时抖动幸存"的劣质 IP(单次握手通过但下一秒就被干扰)
+const STANDBY_CONFIRM_ROUNDS: u32 = 2;
+/// 单域名单轮 standby 扫描的候选上限(与主池 MAX_POOL 同量级,控制探测耗时)
+const STANDBY_MAX_CANDS: usize = 24;
+
+/// Standby 候选:IP + 连续验证通过轮数(独立记分,与主池 fails 体系无关)
+#[derive(Debug, Clone)]
+struct Standby {
+    ip: String,
+    latency_ms: u128,
+    confirm: u32,
+}
+
+/// 各域名独立的 standby 候选空间(与主池分离:刷选过程绝不触碰主池,
+/// 只有验证充分后才做单向合并,不影响正在服务的稳定 IP)
+fn standby_store() -> &'static Mutex<HashMap<String, Vec<Standby>>> {
+    static S: OnceLock<Mutex<HashMap<String, Vec<Standby>>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 单轮 standby 扫描:独立采集(lastgood+DNS+第三方源)→ 探测 → 连续记分。
+/// 只读写 standby_store,不触碰主池。
+fn standby_scan(domain: &str) {
+    // 采集:排除当前主池里已有的 IP——standby 只找"新鲜的替补",不重复验证主力
+    let main_ips: Vec<String> = {
+        let s = lock(store());
+        s.pools.get(domain).map(|v| v.iter().map(|c| c.ip.clone()).collect()).unwrap_or_default()
+    };
+    let lastgood = crate::load_lastgood_pub();
+    let cands: Vec<String> = crate::candidate_pool_with(domain, &lastgood)
+        .into_iter()
+        .filter(|ip| !main_ips.contains(ip))
+        .take(STANDBY_MAX_CANDS)
+        .collect();
+
+    // 探测:复用 probe 模块(真实 TLS 握手 + 拦截页过滤)
+    let ok: HashSet<&str> = crate::probe::probe_all(domain, &cands)
+        .into_iter()
+        .map(|p| cands[p.ip_index].as_str())
+        .collect();
+
+    let mut sb = lock(standby_store());
+    let entry = sb.entry(domain.to_string()).or_default();
+    // 已通过者累加记分,未通过者立即出局(连续通过才有资格)
+    for st in entry.iter_mut() {
+        if ok.contains(st.ip.as_str()) {
+            st.confirm = st.confirm.saturating_add(1);
+        }
+    }
+    entry.retain(|st| ok.contains(st.ip.as_str()));
+    // 新通过的 IP 入 standby(第 1 轮,尚不可合并)
+    for (i, ip) in cands.iter().enumerate() {
+        if ok.contains(ip.as_str()) && !entry.iter().any(|st| &st.ip == ip) {
+            if let Some(p) = crate::probe::probe_all(domain, std::slice::from_ref(&cands[i])).first() {
+                entry.push(Standby { ip: ip.clone(), latency_ms: p.elapsed_ms, confirm: 1 });
+            }
+        }
+    }
+    entry.sort_by_key(|st| st.latency_ms);
+}
+
+/// 把 standby 里验证充分(连续 STANDBY_CONFIRM_ROUNDS 轮通过)的 IP 并入主池。
+/// 只做"追加":现有主池条目(含健康节点)一律不改动、不重排、不清零——
+/// 正在服务的稳定连接不受影响;新 IP 以 fails=0 加入,由 pick_upstream 的
+/// 轮询打散自然分流量。
+fn promote_standby(domain: &str) -> usize {
+    let ready: Vec<Standby> = {
+        let mut sb = lock(standby_store());
+        match sb.get_mut(domain) {
+            Some(entry) => {
+                let (ready, rest): (Vec<_>, Vec<_>) = entry
+                    .drain(..)
+                    .partition(|st| st.confirm >= STANDBY_CONFIRM_ROUNDS);
+                *entry = rest;
+                ready
+            }
+            None => Vec::new(),
+        }
+    };
+    if ready.is_empty() {
+        return 0;
+    }
+    let mut s = lock(store());
+    let pool = s.pools.entry(domain.to_string()).or_default();
+    let mut promoted = 0;
+    for st in ready {
+        if pool.iter().any(|c| c.ip == st.ip) {
+            continue; // 已在主池(可能在扫描间隙被其他路径加入)
+        }
+        pool.push(Cand { ip: st.ip.clone(), fails: 0, latency_ms: st.latency_ms });
+        promoted += 1;
+    }
+    pool.sort_by_key(|c| c.latency_ms);
+    promoted
+}
+
+/// Standby 后台线程主循环:每域名轮流扫描,验证充分者并入主池。
+/// 与 prober_loop 完全独立:主池的探测/刷新/踢出逻辑不受影响。
+fn standby_loop(domains: Vec<String>) {
+    // 首轮等一等:让主池先把首轮探测做完,避免启动时与 prober 抢采集带宽
+    thread::sleep(Duration::from_secs(10));
+    while RUNNING.load(Ordering::SeqCst) {
+        for d in &domains {
+            if !RUNNING.load(Ordering::SeqCst) {
+                break;
+            }
+            standby_scan(d);
+            let n = promote_standby(d);
+            if n > 0 {
+                log!("[*] {} standby 补充 {} 个已验证候选(现役 IP 未受影响)", d, n);
+            }
+        }
+        // 分段休眠,保证 stop() 能及时退出
+        let mut waited = Duration::ZERO;
+        while waited < STANDBY_INTERVAL && RUNNING.load(Ordering::SeqCst) {
+            let step = Duration::from_secs(2).min(STANDBY_INTERVAL - waited);
+            thread::sleep(step);
+            waited += step;
         }
     }
 }

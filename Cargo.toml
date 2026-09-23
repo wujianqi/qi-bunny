@@ -1,6 +1,6 @@
 [package]
 name = "qi-bunny"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0"
 description = "奇小兔(qi-bunny)—— AI 智能体开发辅助工具:开源库的搜索与更新加速"
