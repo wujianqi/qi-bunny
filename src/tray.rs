@@ -44,6 +44,8 @@ enum Cmd {
     Disable,
     /// 代码库管理模式开关(true=开启 SSH 转发,false=关闭并还原)
     SshSet(bool),
+    /// Git 大库模式开关(true=放宽上游超时专治大仓库 clone,false=恢复)
+    GitModeSet(bool),
     Quit,
 }
 
@@ -84,6 +86,9 @@ pub fn run() {
     }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // 恢复上次的 Git 大库模式开关(持久化在 exe 同目录)
+    crate::proxy::load_git_mode();
+    let git_on = crate::proxy::git_mode_enabled();
     let proxy = event_loop.create_proxy();
 
     // 菜单:状态行(只读)+ 开启/关闭/刷新 + 代码库管理模式(勾选) + 关于 + 退出
@@ -92,12 +97,18 @@ pub fn run() {
     let disable = MenuItem::new("关闭代理", false, None);
     let refresh = MenuItem::new("重新测速并刷新", true, None);
     let ssh_mode = tray_icon::menu::CheckMenuItem::new("代码库管理模式(git)", false, true, None);
+    // Git 大库模式:默认关,手动开启后放宽上游读超时专治大仓库 clone 断流
+    let git_mode = tray_icon::menu::CheckMenuItem::new("Git 大库模式(大仓库 clone 加速)", git_on, true, None);
+    // 第三方下载加速(候选手段):链接取自剪贴板,与 hosts 加速完全隔离
+    let fetch = MenuItem::new("加速下载(链接取自剪贴板)", true, None);
     let about = MenuItem::new("关于 qi-bunny…", true, None);
     let quit = MenuItem::new("退出(自动取消代理)", true, None);
     let enable_id = enable.id().clone();
     let disable_id = disable.id().clone();
     let refresh_id = refresh.id().clone();
     let ssh_id = ssh_mode.id().clone();
+    let git_id = git_mode.id().clone();
+    let fetch_id = fetch.id().clone();
     let about_id = about.id().clone();
     let quit_id = quit.id().clone();
 
@@ -110,6 +121,9 @@ pub fn run() {
         &refresh,
         &PredefinedMenuItem::separator(),
         &ssh_mode,
+        &git_mode,
+        &PredefinedMenuItem::separator(),
+        &fetch,
         &PredefinedMenuItem::separator(),
         &about,
         &quit,
@@ -136,6 +150,8 @@ pub fn run() {
     let (tx, rx) = mpsc::channel::<Cmd>();
     // 代码库管理模式当前状态(菜单事件线程翻转勾选项用)
     let ssh_on = Arc::new(AtomicBool::new(false));
+    // Git 大库模式当前状态(菜单点击翻转,与持久化文件保持一致)
+    let git_on_state = Arc::new(AtomicBool::new(crate::proxy::git_mode_enabled()));
     {
         let proxy = proxy.clone();
         let ssh_on = ssh_on.clone();
@@ -224,6 +240,10 @@ pub fn run() {
                                 ));
                             }
                         }
+                        Cmd::GitModeSet(on) => {
+                            // 开关即时生效(转发层每请求读开关),无需重启反代
+                            crate::proxy::set_git_mode(on);
+                        }
                         Cmd::Quit => {
                             // 退出前确保取消代理与代码库管理模式
                             disable_proxy();
@@ -232,8 +252,10 @@ pub fn run() {
                         }
                     },
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // 空闲期:刷新状态行为实时详情(反代 + 链路实测),
-                        // 让菜单第一行始终反映当下链路,而非最后一次事件文案
+                    // 空闲期:刷新状态行为实时详情(反代 + 链路实测),
+                    // 让菜单第一行始终反映当下链路,而非最后一次事件文案。
+                    // 行为与 CLI 一致:开启后驻留不动,只展示状态,
+                    // 不做自检降级(直连兜底 IP 未经测速,反而更不稳)。
                         {
                             let (up, link) = crate::status_detail();
                             let text = if up {
@@ -252,38 +274,7 @@ pub fn run() {
                         // 开启失败后的冷却期内不自动重试(每 5 分钟重测一轮
                         // 无意义且拖慢自检),只倒计时;期间 hosts 无记录,走原始解析
                         if retry_wait > 0 {
-                            retry_wait -= 1;
-                            continue;
-                        }
-                        if proxy_on && self_check_failed() {
-                            // 加速链路失效(hosts 块丢失或 GitHub 不可达):
-                            // 先写直连 IP 保住可达性(代理可以慢,不能断网),
-                            // 再尝试重新测速升回反代模式;升回失败则留在
-                            // 直连模式,下个周期继续重试。
-                            logerr!("[*] 自检失败,先切直连兜底再尝试恢复加速…");
-                            let fallback = crate::write_direct_fallback();
-                            if fallback == 0 {
-                                // 连直连 IP 都拿不到:清掉劫持记录,走系统原始解析
-                                crate::hosts::remove_block();
-                            }
-                            if enable_proxy().is_ok() {
-                                let _ = proxy.send_event(UserEvent::Status(
-                                    true,
-                                    "自检恢复(已重新测速)".into(),
-                                ));
-                            } else if fallback > 0 {
-                                let _ = proxy.send_event(UserEvent::Status(
-                                    true,
-                                    format!("直连兜底({} 条记录),稍后重试加速", fallback),
-                                ));
-                            } else {
-                                proxy_on = false;
-                                retry_wait = RETRY_COOLDOWN_TICKS;
-                                let _ = proxy.send_event(UserEvent::Status(
-                                    false,
-                                    format!("自检恢复失败({}分钟后重试)", RETRY_COOLDOWN_TICKS * 5),
-                                ));
-                            }
+                            retry_wait = retry_wait.saturating_sub(1);
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -311,6 +302,14 @@ pub fn run() {
                 } else if ev.id == ssh_id {
                     let on = !ssh_on.load(Ordering::SeqCst);
                     let _ = menu_tx.send(Cmd::SshSet(on));
+                } else if ev.id == git_id {
+                    // CheckMenuItem 非 Send,不能跨线程读勾选状态:
+                    // 用原子布尔镜像(点击即取反),按下一次状态下发
+                    let on = !git_on_state.load(Ordering::SeqCst);
+                    git_on_state.store(on, Ordering::SeqCst);
+                    let _ = menu_tx.send(Cmd::GitModeSet(on));
+                } else if ev.id == fetch_id {
+                    fetch_from_clipboard();
                 } else if ev.id == about_id {
                     show_about();
                 } else if ev.id == quit_id {
@@ -354,22 +353,28 @@ pub fn run() {
 /// 「关于」对话框:版本、用途说明与合法使用警告(Windows 原生 MessageBox,
 /// 不引入额外 GUI 依赖)
 fn show_about() {
+    let text = format!(
+        "qi-bunny(奇小兔)v{}\n\
+         AI 智能体开发辅助工具:开源库的搜索与更新加速\n\n\
+         本工具仅供个人学习、技术研究与辅助 AI 智能体开发使用\n\
+         (如拉取 GitHub 上的开源代码库、文档、依赖与开发资源)。\n\n\
+         ⚠ 警告:使用者必须遵守所在国家/地区的法律法规,\n\
+         严禁将本工具用于任何非法用途。\n\
+         下载、安装或运行即表示已同意《免责声明与使用限制》\n\
+         (详见项目 README.md)。",
+        env!("CARGO_PKG_VERSION")
+    );
+    message_box(
+        &format!("关于 qi-bunny(奇小兔)v{}", env!("CARGO_PKG_VERSION")),
+        &text,
+        false,
+    );
+}
+
+/// Windows 原生 MessageBox 弹窗(托盘无窗口,提示用;失败也无碍)
+fn message_box(title: &str, text: &str, is_error: bool) {
     #[cfg(windows)]
     {
-        const MB_OK: u32 = 0x0000_0000;
-        const MB_ICONINFORMATION: u32 = 0x0000_0040;
-        let text = format!(
-            "qi-bunny(奇小兔)v{}\n\
-             AI 智能体开发辅助工具:开源库的搜索与更新加速\n\n\
-             本工具仅供个人学习、技术研究与辅助 AI 智能体开发使用\n\
-             (如拉取 GitHub 上的开源代码库、文档、依赖与开发资源)。\n\n\
-             ⚠ 警告:使用者必须遵守所在国家/地区的法律法规,\n\
-             严禁将本工具用于任何非法用途。\n\
-             下载、安装或运行即表示已同意《免责声明与使用限制》\n\
-             (详见项目 README.md)。",
-            env!("CARGO_PKG_VERSION")
-        );
-        let title = format!("关于 qi-bunny(奇小兔)v{}", env!("CARGO_PKG_VERSION"));
         use std::os::windows::ffi::OsStrExt;
         let wide = |s: &str| -> Vec<u16> {
             std::ffi::OsStr::new(s)
@@ -377,41 +382,75 @@ fn show_about() {
                 .chain(std::iter::once(0))
                 .collect()
         };
+        const MB_OK: u32 = 0x0000_0000;
+        const MB_ICONINFORMATION: u32 = 0x0000_0040;
+        const MB_ICONERROR: u32 = 0x0000_0010;
         // MessageBoxW(无窗口句柄、文本、标题、标志);直接调用,失败也无碍
         extern "system" {
             fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, utype: u32) -> i32;
         }
-        let t = wide(&text);
-        let c = wide(&title);
+        let t = wide(text);
+        let c = wide(title);
         unsafe {
-            MessageBoxW(0, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(
+                0,
+                t.as_ptr(),
+                c.as_ptr(),
+                MB_OK | if is_error { MB_ICONERROR } else { MB_ICONINFORMATION },
+            );
         }
-        let _ = (MB_OK, MB_ICONINFORMATION);
+        let _ = (MB_OK, MB_ICONINFORMATION, MB_ICONERROR);
     }
     #[cfg(not(windows))]
     {
-        log!(
-            "qi-bunny(奇小兔)v{} —— 仅供个人学习、技术研究与辅助 AI 智能体开发使用,严禁用于非法用途",
-            env!("CARGO_PKG_VERSION")
-        );
+        let _ = (title, is_error);
+        log!("{}", text);
     }
 }
 
-/// 自检:代理应开启状态下,hosts 块丢失或 github.com 不可达即视为失效。
-/// 用真实 HTTPS 请求验证(走系统 hosts),5 秒超时,失败重试一次防抖。
-fn self_check_failed() -> bool {
-    if !crate::hosts::has_block() {
-        return true; // hosts 记录被外部清掉(如其他工具覆写)
-    }
-
-    let attempt = || -> bool {
-        ureq::get("https://github.com/")
-            .timeout(std::time::Duration::from_secs(5))
-            .call()
-            .is_ok()
-    };
-    // 失败重试一次防抖:两次都失败才判定失效
-    !attempt() && !attempt()
+/// 托盘「加速下载」:链接取自剪贴板,存入系统下载目录,完成后弹窗通知。
+/// 第三方中转下载是候选手段,与 hosts/反代主链路完全隔离,失败不影响加速。
+fn fetch_from_clipboard() {
+    // 独立线程执行:下载含测速可能耗时数十秒,不能卡住菜单事件线程
+    std::thread::spawn(|| {
+        let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) => t,
+            Err(e) => {
+                message_box("加速下载", &format!("读取剪贴板失败:{}", e), true);
+                return;
+            }
+        };
+        // 剪贴板常是整段命令或段落(git clone …、wget …、纯链接),
+        // 先从中提取出 GitHub 链接再校验
+        let url = match crate::sources::extract_github_url(&text) {
+            Some(u) => u,
+            None => {
+                message_box(
+                    "加速下载",
+                    "未在剪贴板中找到 GitHub 链接。请复制 GitHub 文件/Release/Archive 链接(支持整段 git clone 命令)再点击。",
+                    true,
+                );
+                return;
+            }
+        };
+        if let Err(e) = crate::sources::validate_url(&url) {
+            message_box("加速下载", &format!("链接无效:{}", e), true);
+            return;
+        }
+        // 保存到系统下载目录(取不到则退回当前目录)
+        let dir = std::env::var("USERPROFILE")
+            .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let dest = dir.join(crate::sources::filename_from_url(&url));
+        match crate::mirror::download(&url, &dest) {
+            Ok(label) => message_box(
+                "加速下载完成",
+                &format!("已保存:{}\n使用通道:{}", dest.display(), label),
+                false,
+            ),
+            Err(e) => message_box("加速下载失败", &e, true),
+        }
+    });
 }
 
 /// GitHub logo SVG -> RGBA 托盘图标

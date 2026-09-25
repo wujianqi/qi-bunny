@@ -22,44 +22,23 @@ const TIMEOUT: Duration = Duration::from_secs(6);
 /// + hackertarget。返回与 DNS 无关的候选 IP(IPv4 + IPv6)。
 pub fn collect(domain: &str) -> Vec<String> {
     let (tx, rx) = mpsc::channel::<String>();
-    {
+    // 采集通道清单由 address.rs 的 IP_SOURCES 常量提供(地址集中
+    // 管理),按 kind 分派:meta_api 走官方网段接口,url_template 把
+    // {domain} 替换为目标域名后请求页面文本提取 IP。enabled=false
+    // 或类型未知的通道跳过。
+    for src in crate::address::IP_SOURCES.iter().filter(|s| s.enabled).cloned() {
         let tx = tx.clone();
         let domain = domain.to_string();
         thread::spawn(move || {
-            if let Some(ips) = from_meta_api(&domain) {
-                for ip in ips {
-                    let _ = tx.send(ip);
-                }
-            }
-        });
-    }
-    {
-        let tx = tx.clone();
-        let domain = domain.to_string();
-        thread::spawn(move || {
-            if let Some(ips) = from_ipaddress_site(&domain) {
-                for ip in ips {
-                    let _ = tx.send(ip);
-                }
-            }
-        });
-    }
-    {
-        let tx = tx.clone();
-        let domain = domain.to_string();
-        thread::spawn(move || {
-            if let Some(ips) = from_ip138(&domain) {
-                for ip in ips {
-                    let _ = tx.send(ip);
-                }
-            }
-        });
-    }
-    {
-        let tx = tx.clone();
-        let domain = domain.to_string();
-        thread::spawn(move || {
-            if let Some(ips) = from_hackertarget(&domain) {
+            let url = src.url.replace("{domain}", &domain);
+            let ips = match src.kind {
+                "meta_api" => from_meta_api(&url, &domain),
+                "url_template" => from_url_template(&url, src.name),
+                "hackertarget" => from_hackertarget(&url),
+                "hosts_list" => from_hosts_list(&url, &domain),
+                _ => None,
+            };
+            if let Some(ips) = ips {
                 for ip in ips {
                     let _ = tx.send(ip);
                 }
@@ -79,9 +58,8 @@ pub fn collect(domain: &str) -> Vec<String> {
 
 /// GitHub 官方 meta API:取 web/git 网段,每段采样一个代表地址(首地址+1,
 /// 避免网络地址)。仅 github.com 系主域适用,返回 IPv4 采样。
-fn from_meta_api(domain: &str) -> Option<Vec<String>> {
-    // meta API 本身经 api.github.com 查询;若 hosts 已有旧记录则走之
-    let resp = ureq::get("https://api.github.com/meta")
+fn from_meta_api(url: &str, _domain: &str) -> Option<Vec<String>> {
+    let resp = ureq::get(url)
         .timeout(TIMEOUT)
         .call()
         .ok()?;
@@ -103,9 +81,28 @@ fn from_meta_api(domain: &str) -> Option<Vec<String>> {
         None
     } else {
         // 官方网段对任何 github.com 系域名都是有效候选
-        let _ = domain;
         Some(out)
     }
+}
+
+/// url_template 类通道(ipaddress/ip138 等):请求模板 URL(已填域名),
+/// 从响应文本提取 IPv4/IPv6,并按源头特性做基础过滤。
+fn from_url_template(url: &str, name: &str) -> Option<Vec<String>> {
+    let resp = ureq::get(url)
+        .timeout(TIMEOUT)
+        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .call()
+        .ok()?;
+    let text = resp.into_string().ok()?;
+    // 历史解析库混有陈旧/污染/无关记录,按源头限量:
+    // ip138 类历史页按新旧排列只取头部;其余源头不设限由探测层过滤
+    let max = if name == "ip138" { 12 } else { usize::MAX };
+    let ips: Vec<String> = extract_ips(&text)
+        .into_iter()
+        .filter(|ip| !ip.starts_with("127.") && ip != "0.0.0.0")
+        .take(max)
+        .collect();
+    if ips.is_empty() { None } else { Some(ips) }
 }
 
 /// 官方网段采样:每个 CIDR 段内均匀取几个代表地址(不是只取网络地址+1)
@@ -146,49 +143,62 @@ fn sample_cidr_v4_multi(cidr: &str, n: usize) -> Vec<String> {
     out
 }
 
-/// ipaddress.com:抓取该域名的历史解析 IP 列表页,提取页面中的 IPv4/IPv6。
-fn from_ipaddress_site(domain: &str) -> Option<Vec<String>> {
-    let url = format!("https://www.ipaddress.com/website/{}", domain);
-    let resp = ureq::get(&url)
+/// hosts_list 类通道(GitHub520 / ittuann 等公共 hosts 库):拉取
+/// 「IP 域名」映射列表,筛出目标域名的记录。
+/// 支持两种格式:
+///   - JSON 数组(GitHub520 hosts.json):[["1.2.3.4","github.com"], …]
+///   - hosts 文本(ittuann hosts):"1.2.3.4    github.com" 每行一条
+///
+/// 公共库更新及时且带测速择优,是历史解析库之外的高质量补充。
+fn from_hosts_list(url: &str, domain: &str) -> Option<Vec<String>> {
+    let resp = ureq::get(url)
         .timeout(TIMEOUT)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .call()
         .ok()?;
-    let text = resp.into_string().ok()?;
-    Some(extract_ips(&text))
-}
-
-/// ip138:抓取该域名的 IP 历史解析页,提取页面中的 IPv4/IPv6。
-/// 记录集与 ipaddress.com 重叠度低,是多路采集里的国内视角补充。
-/// 历史记录里混有大量陈旧/污染/无关 IP(甚至 127.x),必须限量:
-/// 只取前 N 个,且页面通常按新旧排列,取头部的新鲜记录。
-fn from_ip138(domain: &str) -> Option<Vec<String>> {
-    const MAX_IPS: usize = 12;
-    let url = format!("https://site.ip138.com/{}/", domain);
-    let resp = ureq::get(&url)
-        .timeout(TIMEOUT)
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-        .call()
-        .ok()?;
-    let text = resp.into_string().ok()?;
-    let ips: Vec<String> = extract_ips(&text)
-        .into_iter()
-        .filter(|ip| !ip.starts_with("127.") && ip != "0.0.0.0")
-        .take(MAX_IPS)
-        .collect();
-    if ips.is_empty() {
-        None
+    // hosts 库是 github.com 系专用,主域与库中记录按后缀匹配
+    // (github.com 同时命中 codeload.github.com 等子域记录)
+    let d = domain.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let ctype = resp.content_type().to_string();
+    if ctype.contains("json") {
+        let v: serde_json::Value = resp.into_json().ok()?;
+        if let Some(arr) = v.as_array() {
+            for item in arr {
+                if let Some(pair) = item.as_array() {
+                    let ip = pair.first().and_then(|x| x.as_str()).unwrap_or("");
+                    let host = pair.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                    if host == d || host.ends_with(&format!(".{}", d)) {
+                        out.push(ip.to_string());
+                    }
+                }
+            }
+        }
     } else {
-        Some(ips)
+        let text = resp.into_string().ok()?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let mut it = line.split_whitespace();
+            if let (Some(ip), Some(host)) = (it.next(), it.next()) {
+                let host = host.to_ascii_lowercase();
+                if host == d || host.ends_with(&format!(".{}", d)) {
+                    out.push(ip.to_string());
+                }
+            }
+        }
     }
+    out.retain(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok());
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// hackertarget 的 DNS 查询 API:境外视角解析该域名,与国内 DoH 的
 /// 污染结果互补。只取 "A : x.x.x.x" 行——NS/MX/TXT 行里的域名和文本
 /// 会被宽松提取器误认成候选,把池子灌爆,探测就串行卡死了。
-fn from_hackertarget(domain: &str) -> Option<Vec<String>> {
-    let url = format!("https://api.hackertarget.com/dnslookup/?q={}", domain);
-    let resp = ureq::get(&url)
+fn from_hackertarget(url: &str) -> Option<Vec<String>> {
+    let resp = ureq::get(url)
         .timeout(TIMEOUT)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         .call()
@@ -255,4 +265,70 @@ fn extract_ips(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// ---- 链接辅助函数(原 source.rs,与地址常量 address.rs 分离)----
+
+/// 从一段自由文本(剪贴板内容等)提取可下载的 GitHub 链接。
+/// 兼容常见粘贴形态:
+///   - 纯链接:            https://github.com/u/r/releases/download/v1/x.zip
+///   - git clone 前缀:     git clone https://github.com/u/r.git
+///   - 中文冒号/引号包裹:  链接:「https://github.com/u/r」
+///   - wget/curl 命令:     wget https://github.com/u/r/archive/main.zip
+///
+/// 返回第一个匹配的 https GitHub 链接;找不到返回 None。
+pub fn extract_github_url(text: &str) -> Option<String> {
+    // github.com / raw.githubusercontent.com / gist / codeload 等官方域
+    const GITHUB_HOSTS: &[&str] = &[
+        "https://github.com/",
+        "https://raw.githubusercontent.com/",
+        "https://gist.github.com/",
+        "https://codeload.github.com/",
+        "https://objects.githubusercontent.com/",
+    ];
+    let text = text.trim();
+    for host in GITHUB_HOSTS {
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(host) {
+            let start = from + pos;
+            // 链接终止于空白或中文/英文引号等包裹符
+            let rest = &text[start..];
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | '」' | '》' | ')')
+                })
+                .unwrap_or(rest.len());
+            let url = rest[..end].trim_end_matches(['.', ',', '、']);
+            if url.len() > host.len() {
+                return Some(url.to_string());
+            }
+            from = start + host.len();
+        }
+    }
+    None
+}
+
+/// 校验是否为可下载的 GitHub 资源链接(托盘/CLI 入口共用)
+pub fn validate_url(github_url: &str) -> Result<(), String> {
+    if !github_url.starts_with("https://") || !github_url.contains("github") {
+        return Err(format!("仅支持 GitHub 资源链接,收到: {}", github_url));
+    }
+    Ok(())
+}
+
+/// 从链接推断保存文件名(取路径最后一段;无有效段时用兜底名)
+pub fn filename_from_url(github_url: &str) -> String {
+    let seg = github_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if seg.is_empty() {
+        "qi-bunny-download.bin".to_string()
+    } else {
+        seg.to_string()
+    }
 }

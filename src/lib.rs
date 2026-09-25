@@ -11,9 +11,11 @@
 //!
 //! 需要 管理员(root) 权限运行以写入 hosts。
 
+pub mod address;
 pub mod cert;
 pub mod dns;
 pub mod hosts;
+pub mod mirror;
 pub mod probe;
 pub mod proxy;
 pub mod sources;
@@ -177,13 +179,11 @@ fn check_hosts_writable() -> Result<(), String> {
 /// 返回 (反代运行?, 链路摘要);链路摘要空串表示未测(加速未开启)。
 pub fn status_detail() -> (bool, String) {
     // 反代运行状态:443 端口可连即运行中(托盘进程或本进程监听均占用端口)
-    let proxy_up = std::net::TcpStream::connect_timeout(
-        &"127.0.0.1:443"
-            .parse()
-            .expect("常量地址 127.0.0.1:443 解析失败"),
-        std::time::Duration::from_millis(300),
-    )
-    .is_ok();
+    // 常量地址解析失败时跳过对应检测(不 panic,状态行显示未开启即可)
+    let addr_443: Option<std::net::SocketAddr> = "127.0.0.1:443".parse().ok();
+    let proxy_up = addr_443.is_some_and(|a| {
+        std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(300)).is_ok()
+    });
 
     // 链路实测:走 HTTP 80(github.com 会 301 到 https),请求经
     // hosts -> 本机反代 -> 上游,与浏览器链路一致;TLS 无法在无证书校验的
@@ -191,9 +191,7 @@ pub fn status_detail() -> (bool, String) {
     let link = (|| -> Option<String> {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect_timeout(
-            &"127.0.0.1:80"
-                .parse()
-                .expect("常量地址 127.0.0.1:80 解析失败"),
+            &"127.0.0.1:80".parse().ok()?,
             std::time::Duration::from_millis(1500),
         )
         .ok()?;

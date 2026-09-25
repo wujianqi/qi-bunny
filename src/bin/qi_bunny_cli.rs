@@ -28,6 +28,9 @@ fn print_help() {
   status   查看加速状态(hosts 是否写入 / ssh config 是否托管 / CA 信任状态)
   cert     生成并安装本地 CA 根证书(MITM 加速模式需要,一次性;需管理员权限)
   clean    清理全部记录(hosts 标记块 + ssh config 标记块)
+  fetch <链接> <保存路径>
+           第三方下载加速(候选手段):经公共中转源下载 GitHub
+           单文件/Releases 资产/仓库 Archive,自动测速择优、逐源回退
   help     显示本帮助
 
 全局选项:
@@ -66,6 +69,7 @@ fn main() {
         Some("status") => status_run(),
         Some("cert") => cert_run(),
         Some("clean") => clean_run(),
+        Some("fetch") => fetch_run(&args[1..]),
         // ---- 未知参数:报错 + 帮助,退出码 2 ----
         Some(other) => {
             eprintln!("[!] 未知子命令: {}\n", other);
@@ -152,6 +156,14 @@ fn status_run() {
         qi_bunny::cert::TrustStatus::Unknown => "未知",
     };
     println!("  本地 CA(MITM): {}", trust_text);
+    println!(
+        "  Git 大库模式: {}",
+        if qi_bunny::proxy::git_mode_enabled() {
+            "已开启(大仓库 clone 读超时放宽至 5 分钟)"
+        } else {
+            "未开启(托盘菜单可开启)"
+        }
+    );
 }
 
 /// 子命令 clean:清理 hosts 与 ssh config 的全部标记块(含旧版残留)
@@ -167,6 +179,30 @@ fn clean_run() {
     }
     if n == 0 {
         println!("[*] 未发现本工具的记录,无需清理。");
+    }
+}
+
+/// 子命令 fetch:第三方中转源下载加速(候选手段,与 hosts 加速完全隔离)
+fn fetch_run(args: &[String]) {
+    if args.len() != 2 {
+        eprintln!("[!] 用法: qi-bunny-cli fetch <GitHub链接> <保存路径>\n");
+        std::process::exit(2);
+    }
+    // 链接参数兼容整段命令(git clone … / wget …),先提取出 GitHub 链接
+    let url = match qi_bunny::sources::extract_github_url(&args[0]) {
+        Some(u) => u,
+        None => {
+            eprintln!("[!] 未在参数中找到 GitHub 链接: {}\n", args[0]);
+            std::process::exit(2);
+        }
+    };
+    let dest = std::path::PathBuf::from(&args[1]);
+    match qi_bunny::mirror::download(&url, &dest) {
+        Ok(label) => println!("[+] 下载完成: {} -> {}", label, dest.display()),
+        Err(e) => {
+            eprintln!("[!] {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

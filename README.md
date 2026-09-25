@@ -12,13 +12,14 @@
 
 - **HTTPS 加速**:启动即把 GitHub 域名指向 `127.0.0.1`,由**本机 SNI 反向代理**承载全部 HTTPS 流量
 - **代码库管理模式(SSH)**:本地端口转发承载 `git push / git pull`,解决"网页能打开、库更新/推送不上去"的问题
+- **加速下载(第三方中转,候选手段)**:单文件 / Release 资产 / 仓库 Archive 经公共中转站下载,自动测速择优、逐源回退,与主链路完全隔离
 - **托盘驻留**:启动后缩到系统托盘,图标即状态,菜单即控制
 
 程序完全本地运行,不依赖任何第三方代理服务器;TLS 流量**端到端透传**(不解密、不替换证书,证书校验仍由浏览器完成),所有候选上游 IP 均经过真实 TLS 握手验证。
 
 ## 功能特性
 
-### 多通道候选 IP 采集(五路独立来源)
+### 多通道候选 IP 采集(六路独立来源)
 
 任何一路被干扰时其余几路自动补位:
 
@@ -28,7 +29,8 @@
 | UDP 53 DNS | 3 个国内公共 DNS,DoH 全挂时兜底 |
 | IPv6(AAAA) | 与 IPv4 同时采集,扩充地址池 |
 | GitHub 官方 meta API | 官方公布网段采样,权威可靠 |
-| ipaddress.com | 第三方历史解析记录抓取 |
+| ipaddress.com / ip138 / hackertarget | 第三方历史解析与境外 DNS,国内外视角互补 |
+| GitHub520 / ittuann 公共 hosts 库 | 持续维护的 IP 映射列表,更新及时 |
 
 另有**last-known-good 缓存**(成功 IP 记盘,下次优先参选,DNS 异常时也有可用起点)。
 
@@ -76,6 +78,7 @@ qi-bunny.exe
 | 开启加速 / 关闭加速 | 手动开关 HTTPS 浏览加速(自动模式之外的手动兜底) |
 | 重新测速并刷新 | 某域名打不开时手动换 IP |
 | 代码库管理模式 | 勾选开启,让 `git push/pull` 走加速链路 |
+| 加速下载(链接取自剪贴板) | 复制 GitHub 链接(支持整段 `git clone …` 命令)后点击,经第三方中转站下载到系统「下载」文件夹,完成后弹窗提示 |
 | 退出 | 自动取消代理、还原 ssh config |
 
 **方式二:命令行模式**
@@ -87,6 +90,8 @@ qi-bunny-cli start    # HTTPS 加速:测速写入 hosts,本机反代接管(默�
 qi-bunny-cli stop     # 手动取消加速:移除 hosts / ssh config 标记块
 qi-bunny-cli git      # 代码库管理模式:SSH 转发,关闭窗口即还原
 qi-bunny-cli status   # 查看加速状态(hosts / ssh config)
+qi-bunny-cli fetch <链接> <保存路径>
+                      # 加速下载:经第三方中转站下载单文件/Release/Archive
 qi-bunny-cli clean    # 清理全部记录(hosts + ssh config,含旧版残留)
 qi-bunny-cli help     # 帮助(亦支持 -h/--help/-V/--version)
 ```
@@ -111,7 +116,16 @@ qi-bunny-cli help     # 帮助(亦支持 -h/--help/-V/--version)
 
 之后 `git push` / `git pull` 正常操作即可;取消勾选自动还原配置。
 
-**场景 4:程序被强杀留下残留**
+**场景 4:下载 Release / Archive 文件慢或失败**
+
+复制下载链接后任选其一:
+
+- 托盘菜单「加速下载(链接取自剪贴板)」——支持整段 `git clone …`/`wget …` 命令或纯链接,自动提取,存入系统「下载」文件夹
+- 命令行 `qi-bunny-cli fetch <链接> <保存路径>`——保存路径自行指定
+
+下载时自动对全部中转源测速,从最快的源开始尝试,单个源失败自动切换下一个,全部失败回退 github.com 直连。
+
+**场景 5:程序被强杀留下残留**
 
 ```
 qi-bunny-cli clean
@@ -128,6 +142,7 @@ qi-bunny-cli clean
 | `qi-bunny-cli stop` | 手动取消加速 | 执行完即退出 |
 | `qi-bunny-cli git` | 代码库管理模式 | 关窗口 / Ctrl+C 自动还原 |
 | `qi-bunny-cli status` | 查看加速状态(只读) | 执行完即退出 |
+| `qi-bunny-cli fetch <链接> <保存路径>` | 加速下载(第三方中转,候选手段) | 执行完即退出 |
 | `qi-bunny-cli clean` | 清理全部记录(含旧版残留) | 执行完即退出 |
 | `qi-bunny-cli help` | 帮助 | 执行完即退出 |
 
@@ -136,6 +151,19 @@ qi-bunny-cli clean
 本工具的加速机制:启动即把 GitHub 域名指向 `127.0.0.1`,由**本机 SNI 反向代理**承载 HTTPS 流量:代理解析 TLS ClientHello 中的 SNI 识别目标域名,把整条 TLS 流量**端到端透传**到健康上游 IP(不解密,证书校验仍由浏览器完成),每条连接动态挑选最优上游、失败自动换路;代码库管理模式再以 SSH 本地端口转发承载 `git push/pull`。全部功能均在本地完成,不依赖第三方代理服务器。
 
 质量保障机制:多通道候选采集、真实 TLS 握手测速(过滤 403 滥用拦截)、每连接动态择路、后台周期探测换血、last-known-good 缓存与 5 分钟自检恢复,层层保障链路质量。
+
+## 源头扩展
+
+两类源头集中在 `src/address.rs` 的常量表中,增删改这一个文件后重新编译即可:
+
+| 常量 | 用途 | 字段 |
+|---|---|---|
+| `IP_SOURCES` | 候选 IP 采集通道(DNS 之外的独立来源) | `name` / `kind`(meta_api、url_template、hackertarget、hosts_list)/ `url`(支持 `{domain}` 占位符)/ `enabled` |
+| `MIRROR_SOURCES` | 加速下载的第三方中转站 | 直接列出 `https://` 域名 |
+
+- 加速下载前会对全部中转源并发测速,死源自动过滤垫底,列表里多放几个失效源无碍
+- 新增 `url_template` 类 IP 源头时,程序会自动请求替换域名后的 URL 并从响应文本提取 IPv4/IPv6
+- 新增 `hosts_list` 类源头时,支持 JSON 数组(`[["1.2.3.4","github.com"],…]`)与 hosts 文本两种格式
 
 ## 证书说明
 

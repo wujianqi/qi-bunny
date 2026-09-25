@@ -1,6 +1,6 @@
 [package]
 name = "qi-bunny"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-3.0"
 description = "奇小兔(qi-bunny)—— AI 智能体开发辅助工具:开源库的搜索与更新加速"
@@ -43,10 +43,13 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 # 托盘后台模式
 tray-icon = "0.19"          # 托盘图标/菜单
 tao = "0.30"                # 事件循环(托盘菜单事件泵)
+# 托盘「第三方下载加速」读剪贴板取下载链接(仅文本,禁默认特性控制体积)
+arboard = { version = "3", default-features = false }
 windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",  # CreateMutexW 单实例互斥锁
     "Win32_Foundation",        # HANDLE / ERROR_ALREADY_EXISTS
     "Win32_Security",          # CreateMutexW 的 SECURITY_ATTRIBUTES 参数
+    "Win32_UI_WindowsAndMessaging",  # MessageBoxW 下载完成/失败提示
 ] }
 # GitHub logo(SVG)渲染为托盘图标
 resvg = "0.42"

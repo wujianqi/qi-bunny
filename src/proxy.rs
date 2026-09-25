@@ -386,6 +386,7 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<Option<PlainRequest>
     let mut domain = String::new();
     let mut close = false;
     let mut content_length = 0usize;
+    let mut chunked = false;
     let mut connection_seen = false;
     for line in lines {
         if let Some(v) = line
@@ -409,6 +410,14 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<Option<PlainRequest>
         {
             content_length = v.trim().parse().unwrap_or(0);
         }
+        if let Some(v) = line
+            .strip_prefix("Transfer-Encoding:")
+            .or_else(|| line.strip_prefix("transfer-encoding:"))
+        {
+            if v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            }
+        }
     }
     if domain.is_empty() {
         return Ok(None);
@@ -418,9 +427,29 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<Option<PlainRequest>
         close = false;
     }
 
-    // 读请求体
+    // 读请求体:Content-Length 或 chunked(git push 的 pack 上传用 chunked)
     let mut body = Vec::new();
-    if content_length > 0 && content_length <= 8 * 1024 * 1024 {
+    if chunked {
+        // 头部 \r\n\r\n 之后可能已混入体的开头,先接上再继续读
+        if let Some(pos) = find_head_end(&head) {
+            let consumed = pos + 4;
+            if head.len() > consumed {
+                body.extend_from_slice(&head[consumed..]);
+            }
+        }
+        // 读到终止块(0 长度块 "0\r\n\r\n")为止;不做解码,转发时
+        // 会剥掉 Transfer-Encoding 换成 Content-Length 重建头
+        while !body.ends_with(b"0\r\n\r\n") {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break; // 半截 chunked 体:按已有数据交付(转发层会因失败重试)
+            }
+            body.extend_from_slice(&buf[..n]);
+            if body.len() > 2 * 1024 * 1024 * 1024usize {
+                break; // 防失控上限(2 GiB)
+            }
+        }
+    } else if content_length > 0 && content_length <= 8 * 1024 * 1024 {
         // 头部里可能已带上体的开头;这里简化:头部 \r\n\r\n 之后的部分
         if let Some(pos) = find_head_end(&head) {
             let consumed = pos + 4;
@@ -461,6 +490,47 @@ fn find_head_end(data: &[u8]) -> Option<usize> {
 
 /// 单请求转发预算:单 IP 上游整体(连接+发+收响应头)超时
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Git 大库模式下的上游读超时:clone/fetch 的 pack 可达数百 MB,
+/// 10s 预算必然中途超时;放宽到 5 分钟(空闲中断仍会按分帧校验失败重试)
+const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Git 模式开关持久化文件名(exe 同目录,与 qi-bunny.good 同策略)
+const GIT_MODE_FILE: &str = "qi-bunny.gitmode";
+
+/// Git 大库模式(默认关):托盘菜单手动开启后放宽上游超时,
+/// 专治大仓库 clone/fetch 中途被 10s 预算掐断的问题。
+/// 转发层每请求都读此开关,无需重启反代。
+pub static GIT_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 开关 Git 大库模式并持久化(exe 同目录小文件,存在即开)
+pub fn set_git_mode(on: bool) {
+    GIT_MODE.store(on, Ordering::SeqCst);
+    let path = git_mode_path();
+    if on {
+        let _ = std::fs::write(&path, b"on");
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// 读取持久化的 Git 模式开关(启动时调用;也供 CLI status 查询)
+pub fn git_mode_enabled() -> bool {
+    GIT_MODE.load(Ordering::SeqCst)
+}
+
+/// 从持久化文件恢复 Git 模式(托盘/CLI 启动时各调一次)
+pub fn load_git_mode() {
+    let on = git_mode_path().exists();
+    GIT_MODE.store(on, Ordering::SeqCst);
+}
+
+fn git_mode_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match exe.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(GIT_MODE_FILE),
+        _ => std::path::PathBuf::from(GIT_MODE_FILE),
+    }
+}
+
 /// 单请求最多尝试的候选 IP 数(全部失败后回 DNS 递补再来一轮)
 const FORWARD_MAX_IPS: usize = 4;
 
@@ -548,6 +618,8 @@ fn send_request_to_ip(
         // 暖连接已死(被上游/中间设备关闭)在此静默降级冷连——错误不外抛,
         // 避免转发层把"连接池陈旧"误记成该 IP 故障
         if let Some(mut warm) = warm_take(domain, ip) {
+            // 借用时刷新读超时:连接入池时的 GIT_MODE 可能已变化
+            warm.tls.get_ref().set_read_timeout(Some(upstream_read_timeout())).ok();
             match write_and_read_reusable(&mut warm.tls, req) {
                 Ok((resp, true)) => {
                     warm_put(domain, ip, warm.tls);
@@ -579,7 +651,14 @@ fn send_request_to_ip(
         let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT)
             .map_err(|e| e.to_string())?;
         stream.set_nodelay(true).ok();
-        stream.set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
+        // Git 大库模式放宽读超时:pack 传输可达数分钟(写超时保持不变,
+        // 上传卡死该快速失败)
+        let read_timeout = if GIT_MODE.load(Ordering::SeqCst) {
+            UPSTREAM_GIT_TIMEOUT
+        } else {
+            UPSTREAM_REQUEST_TIMEOUT
+        };
+        stream.set_read_timeout(Some(read_timeout)).ok();
         stream.set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
         write_and_read_response(&mut stream, req)
     }
@@ -604,7 +683,7 @@ fn write_and_read_reusable<S: Read + Write>(
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if line.is_empty() || lower.starts_with("host:") || lower.starts_with("connection:") || lower.starts_with("keep-alive:") {
+        if line.is_empty() || lower.starts_with("host:") || lower.starts_with("connection:") || lower.starts_with("keep-alive:") || lower.starts_with("transfer-encoding:") {
             continue;
         }
         out.extend_from_slice(line.as_bytes());
@@ -612,6 +691,9 @@ fn write_and_read_reusable<S: Read + Write>(
     }
     out.extend_from_slice(format!("Host: {}\r\n", req.domain).as_bytes());
     out.extend_from_slice(b"Connection: keep-alive\r\n");
+    // 请求体已在读取端收齐,统一按定长重建:上游对 chunked 请求的
+    // 支持参差,Content-Length 兼容性最好
+    out.extend_from_slice(format!("Content-Length: {}\r\n", req.body.len()).as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&req.body);
 
@@ -640,7 +722,7 @@ fn write_and_read_response<S: Read + Write>(stream: &mut S, req: &PlainRequest) 
         let lower = line.to_ascii_lowercase();
         // head 保留到 \r\n\r\n,lines() 会在结尾产生空行——必须跳过,
         // 否则空行提前终止请求头,后面的 Host/Connection 全被上游当成 body
-        if line.is_empty() || lower.starts_with("host:") || lower.starts_with("connection:") || lower.starts_with("keep-alive:") {
+        if line.is_empty() || lower.starts_with("host:") || lower.starts_with("connection:") || lower.starts_with("keep-alive:") || lower.starts_with("transfer-encoding:") {
             continue; // 下面统一重写
         }
         out.extend_from_slice(line.as_bytes());
@@ -648,6 +730,8 @@ fn write_and_read_response<S: Read + Write>(stream: &mut S, req: &PlainRequest) 
     }
     out.extend_from_slice(format!("Host: {}\r\n", req.domain).as_bytes());
     out.extend_from_slice(b"Connection: close\r\n");
+    // 请求体已在读取端收齐,统一按定长重建(理由同 keep-alive 版)
+    out.extend_from_slice(format!("Content-Length: {}\r\n", req.body.len()).as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&req.body);
 
@@ -658,12 +742,29 @@ fn write_and_read_response<S: Read + Write>(stream: &mut S, req: &PlainRequest) 
     read_full_response(stream)
 }
 
+/// 判断(头部已定位的)响应体是否按分帧收齐:Content-Length 读满 /
+/// chunked 见终止块 / 无分帧声明(close 语义,只能靠 EOF 判定)。
+fn response_framing_complete(resp: &[u8], head_end: usize) -> bool {
+    let head = String::from_utf8_lossy(&resp[..head_end]);
+    let lower = head.to_ascii_lowercase();
+    if let Some(cl) = extract_header(&lower, "content-length:")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return resp.len() >= head_end + 4 + cl;
+    }
+    if lower.contains("transfer-encoding:") && lower.contains("chunked") {
+        return resp.ends_with(b"0\r\n\r\n");
+    }
+    true
+}
+
 /// 读完整 HTTP 响应:优先按头部声明的分帧终止,
 ///   - Content-Length:读够头 + N 字节即止;
 ///   - Transfer-Encoding: chunked:读到终止块(0 长度块)即止;
 ///   - 都没有:按 Connection: close 语义读到 EOF。
 ///
-/// 上游若忽略 close 语义保持连接,这里也不会白等到超时才丢掉已收数据。
+/// 分帧已声明但未收齐时(超时/上游提前断开)一律报错,交由转发层
+/// 换候选重试——git 等客户端对半截响应零容忍,截断交付必失败且更难排查。
 fn read_full_response<S: Read>(stream: &mut S) -> Result<Vec<u8>, String> {
     let mut resp = Vec::with_capacity(16 * 1024);
     let mut buf = [0u8; 16 * 1024];
@@ -671,36 +772,33 @@ fn read_full_response<S: Read>(stream: &mut S) -> Result<Vec<u8>, String> {
     loop {
         // 头部已完整且按其分帧判定已到体末尾 → 提前收工
         if let Some(pos) = head_end {
-            let head = String::from_utf8_lossy(&resp[..pos]);
-            let lower = head.to_ascii_lowercase();
-            if let Some(cl) = extract_header(&lower, "content-length:")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                if resp.len() >= pos + 4 + cl {
-                    break;
-                }
-            } else if lower.contains("transfer-encoding:") && lower.contains("chunked") {
-                // 终止块:0 长度块出现在尾部("0\r\n\r\n",可能带 trailer 前先见 \r\n)
-                if resp.ends_with(b"0\r\n\r\n") {
-                    break;
-                }
+            if response_framing_complete(&resp, pos) {
+                break;
             }
             // 无 CL 无 chunked:只能读到 EOF
         }
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF:close 语义正常结束
+            Ok(0) => {
+                // EOF:close 语义正常结束;分帧未收齐则是上游提前断开
+                if let Some(pos) = head_end {
+                    if !response_framing_complete(&resp, pos) {
+                        return Err("上游连接提前关闭,响应被截断".into());
+                    }
+                }
+                break;
+            }
             Ok(n) => {
                 resp.extend_from_slice(&buf[..n]);
                 if head_end.is_none() {
                     head_end = find_head_end(&resp);
                 }
-                if resp.len() > 32 * 1024 * 1024 {
-                    break; // 防失控上限
-                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                // 超时:头都不完整或体未按分帧收齐才算失败,否则按已有数据交付
-                if head_end.is_none() {
+                // 头不完整才交出去也是废响应;分帧未收齐同样按失败处理
+                let complete = head_end
+                    .map(|pos| response_framing_complete(&resp, pos))
+                    .unwrap_or(false);
+                if !complete {
                     return Err("上游响应超时".into());
                 }
                 break;
@@ -716,7 +814,8 @@ fn read_full_response<S: Read>(stream: &mut S) -> Result<Vec<u8>, String> {
 
 /// 读完整响应并判定连接可否复用(keep-alive):按 Content-Length/chunked
 /// 分帧收齐 → (响应, true);靠 EOF 才收齐(close 语义)→ (响应, false)。
-/// 内部逻辑与 read_full_response 相同,仅额外追踪分帧终止是否命中。
+/// 内部逻辑与 read_full_response 相同,仅额外追踪分帧终止是否命中;
+/// 分帧已声明但未收齐(超时/EOF)时报错,不交付半截响应。
 fn read_full_response_framed<S: Read>(stream: &mut S) -> Result<(Vec<u8>, bool), String> {
     let mut resp = Vec::with_capacity(16 * 1024);
     let mut buf = [0u8; 16 * 1024];
@@ -724,35 +823,31 @@ fn read_full_response_framed<S: Read>(stream: &mut S) -> Result<(Vec<u8>, bool),
     let mut framed_end = false;
     loop {
         if let Some(pos) = head_end {
-            let head = String::from_utf8_lossy(&resp[..pos]);
-            let lower = head.to_ascii_lowercase();
-            if let Some(cl) = extract_header(&lower, "content-length:")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                if resp.len() >= pos + 4 + cl {
-                    framed_end = true;
-                    break;
-                }
-            } else if lower.contains("transfer-encoding:") && lower.contains("chunked") {
-                if resp.ends_with(b"0\r\n\r\n") {
-                    framed_end = true;
-                    break;
-                }
+            if response_framing_complete(&resp, pos) {
+                framed_end = true;
+                break;
             }
         }
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF:close 语义,不可复用
+            Ok(0) => {
+                if let Some(pos) = head_end {
+                    if !response_framing_complete(&resp, pos) {
+                        return Err("上游连接提前关闭,响应被截断".into());
+                    }
+                }
+                break; // EOF:close 语义,不可复用
+            }
             Ok(n) => {
                 resp.extend_from_slice(&buf[..n]);
                 if head_end.is_none() {
                     head_end = find_head_end(&resp);
                 }
-                if resp.len() > 32 * 1024 * 1024 {
-                    break;
-                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                if head_end.is_none() {
+                let complete = head_end
+                    .map(|pos| response_framing_complete(&resp, pos))
+                    .unwrap_or(false);
+                if !complete {
                     return Err("上游响应超时".into());
                 }
                 break;
@@ -826,7 +921,8 @@ struct WarmConn {
 
 /// 暖池:键 = (domain, ip),值 = 该上游的空闲长连接列表(LIFO 复用)
 fn warm_pool() -> &'static Mutex<HashMap<(String, String), Vec<WarmConn>>> {
-    static S: OnceLock<Mutex<HashMap<(String, String), Vec<WarmConn>>>> = OnceLock::new();
+    type WarmMap = HashMap<(String, String), Vec<WarmConn>>;
+    static S: OnceLock<Mutex<WarmMap>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -940,6 +1036,15 @@ fn fastrand_idx() -> usize {
     (x % 36) as usize
 }
 
+/// 上游读超时:Git 大库模式下放宽(pack 传输可达数分钟)
+fn upstream_read_timeout() -> Duration {
+    if GIT_MODE.load(Ordering::SeqCst) {
+        UPSTREAM_GIT_TIMEOUT
+    } else {
+        UPSTREAM_REQUEST_TIMEOUT
+    }
+}
+
 /// 对上游建立 TLS 连接(握手完成),供暖池预热与冷连路径共用。
 /// SNI 伪装优先(随机子域),握手被 RST 时回退真实域名重试一次——
 /// 通配符证书使两种 SNI 都能通过 webpki 校验。
@@ -951,7 +1056,7 @@ fn tls_connect(domain: &str, ip: &str) -> Result<rustls::StreamOwned<rustls::Cli
         .ok_or("bad ip")?;
     let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
     stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
+    stream.set_read_timeout(Some(upstream_read_timeout())).ok();
     stream.set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
 
     // 伪装 SNI 握手:先在裸流上 complete_io 驱动完整握手,失败(典型为
@@ -1337,7 +1442,7 @@ fn standby_scan(domain: &str) {
 /// - 池深 ≤ 1(应急):1 轮探测通过即临时并入,标 probation,由真实转发
 ///   验证——成功转正,失败立即踢出。最坏恢复时间从"2 轮确认"的分钟级
 ///   压到一次采集+探测的十几秒级
-/// 合并仍是"追加":现有主池条目(含健康节点)一律不改动、不重排、不清零。
+///   合并仍是"追加":现有主池条目(含健康节点)一律不改动、不重排、不清零。
 fn promote_standby(domain: &str) -> usize {
     // 应急判定:主池健康候选 ≤ 1 时启用快速通道
     let urgent = {
@@ -1388,7 +1493,8 @@ fn promote_standby(domain: &str) -> usize {
 /// Standby 后台线程主循环(事件驱动):
 /// - mark_fail 的失败事件会唤醒本线程,只对失败域名立即采集+探测补池,
 ///   平时主池健康则完全静默——零探测流量,不向网络暴露批量探测特征;
-/// - 无事件时低频兜底扫描全部域名(防"从未有流量"的域名候选陈旧)。
+///   - 无事件时低频兜底扫描全部域名(防"从未有流量"的域名候选陈旧)。
+///
 /// 与 prober_loop 完全独立:主池的探测/刷新/踢出逻辑不受影响。
 fn standby_loop(domains: Vec<String>) {
     // 首轮等一等:让主池先把首轮探测做完,避免启动时与 prober 抢采集带宽
