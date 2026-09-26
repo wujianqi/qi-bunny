@@ -2,7 +2,7 @@
 //!
 //! 本 crate 为共享库,由两个二进制复用:
 //!   - qi-bunny     托盘后台模式(GUI 子系统,无控制台窗口)
-//!   - qi-bunny-cli 命令行模式(控制台子系统,cli/git/clean 子命令)
+//!   - qi-bunny-cli 命令行模式(控制台子系统,start/fetch/clean 子命令)
 //!
 //! 原理(Hosts 模式):
 //!   1. 多路 DoH + UDP DNS 收集各域名全部候选 IP
@@ -16,10 +16,11 @@ pub mod cert;
 pub mod dns;
 pub mod hosts;
 pub mod mirror;
+#[cfg(windows)]
+pub mod notify;
 pub mod probe;
 pub mod proxy;
 pub mod sources;
-pub mod ssh;
 pub mod tray;
 
 use std::sync::atomic::AtomicBool;
@@ -218,6 +219,17 @@ pub fn enable_proxy() -> Result<Vec<(String, String)>, String> {
 
     // 1) 前置权限检查,不可写直接失败
     check_hosts_writable()?;
+
+    // 1.5) 本地 CA 未信任时自动导入受信任根(MITM 加速前提,一次性):
+    // 此路径已要求管理员权限,certutil -addstore 可静默完成,无需人工
+    // cert 子命令;失败不阻塞加速(浏览器报证书错误时再提示)
+    if matches!(cert::ca_trust_status(), cert::TrustStatus::Missing) {
+        log!("[*] 本地 CA 未信任,自动导入系统受信任根…");
+        match cert::install_ca_to_trust() {
+            Ok(()) => log!("[+] 本地 CA 已自动安装到受信任的根证书颁发机构。"),
+            Err(e) => logerr!("[!] 本地 CA 自动安装失败({}),浏览器将报证书错误;可手动运行 qi-bunny-cli cert", e),
+        }
+    }
 
     // 2) 启动本机反代(幂等):后台立即开始首轮全量探测
     let domains: Vec<String> = DOMAINS.iter().map(|s| s.to_string()).collect();

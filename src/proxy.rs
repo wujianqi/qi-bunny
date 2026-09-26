@@ -490,46 +490,6 @@ fn find_head_end(data: &[u8]) -> Option<usize> {
 
 /// 单请求转发预算:单 IP 上游整体(连接+发+收响应头)超时
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Git 大库模式下的上游读超时:clone/fetch 的 pack 可达数百 MB,
-/// 10s 预算必然中途超时;放宽到 5 分钟(空闲中断仍会按分帧校验失败重试)
-const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_secs(300);
-/// Git 模式开关持久化文件名(exe 同目录,与 qi-bunny.good 同策略)
-const GIT_MODE_FILE: &str = "qi-bunny.gitmode";
-
-/// Git 大库模式(默认关):托盘菜单手动开启后放宽上游超时,
-/// 专治大仓库 clone/fetch 中途被 10s 预算掐断的问题。
-/// 转发层每请求都读此开关,无需重启反代。
-pub static GIT_MODE: AtomicBool = AtomicBool::new(false);
-
-/// 开关 Git 大库模式并持久化(exe 同目录小文件,存在即开)
-pub fn set_git_mode(on: bool) {
-    GIT_MODE.store(on, Ordering::SeqCst);
-    let path = git_mode_path();
-    if on {
-        let _ = std::fs::write(&path, b"on");
-    } else {
-        let _ = std::fs::remove_file(&path);
-    }
-}
-
-/// 读取持久化的 Git 模式开关(启动时调用;也供 CLI status 查询)
-pub fn git_mode_enabled() -> bool {
-    GIT_MODE.load(Ordering::SeqCst)
-}
-
-/// 从持久化文件恢复 Git 模式(托盘/CLI 启动时各调一次)
-pub fn load_git_mode() {
-    let on = git_mode_path().exists();
-    GIT_MODE.store(on, Ordering::SeqCst);
-}
-
-fn git_mode_path() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    match exe.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(GIT_MODE_FILE),
-        _ => std::path::PathBuf::from(GIT_MODE_FILE),
-    }
-}
 
 /// 单请求最多尝试的候选 IP 数(全部失败后回 DNS 递补再来一轮)
 const FORWARD_MAX_IPS: usize = 4;
@@ -618,7 +578,7 @@ fn send_request_to_ip(
         // 暖连接已死(被上游/中间设备关闭)在此静默降级冷连——错误不外抛,
         // 避免转发层把"连接池陈旧"误记成该 IP 故障
         if let Some(mut warm) = warm_take(domain, ip) {
-            // 借用时刷新读超时:连接入池时的 GIT_MODE 可能已变化
+            // 借用时刷新读超时:连接入池后可能已闲置较久
             warm.tls.get_ref().set_read_timeout(Some(upstream_read_timeout())).ok();
             match write_and_read_reusable(&mut warm.tls, req) {
                 Ok((resp, true)) => {
@@ -651,14 +611,7 @@ fn send_request_to_ip(
         let mut stream = TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT)
             .map_err(|e| e.to_string())?;
         stream.set_nodelay(true).ok();
-        // Git 大库模式放宽读超时:pack 传输可达数分钟(写超时保持不变,
-        // 上传卡死该快速失败)
-        let read_timeout = if GIT_MODE.load(Ordering::SeqCst) {
-            UPSTREAM_GIT_TIMEOUT
-        } else {
-            UPSTREAM_REQUEST_TIMEOUT
-        };
-        stream.set_read_timeout(Some(read_timeout)).ok();
+        stream.set_read_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
         stream.set_write_timeout(Some(UPSTREAM_REQUEST_TIMEOUT)).ok();
         write_and_read_response(&mut stream, req)
     }
@@ -874,6 +827,7 @@ fn is_block_page(resp: &[u8]) -> bool {
     text.contains("Access to this site has been restricted")
         || text.contains("Whoa there!")
         || text.contains("has been restricted")
+        || text.contains("Fastly error: unknown domain")
 }
 
 /// 上游 5xx 判定:读响应头第一行的状态码,50x 即视为该出口劣化
@@ -1036,13 +990,9 @@ fn fastrand_idx() -> usize {
     (x % 36) as usize
 }
 
-/// 上游读超时:Git 大库模式下放宽(pack 传输可达数分钟)
+/// 上游读超时:连接借用与冷连路径共用
 fn upstream_read_timeout() -> Duration {
-    if GIT_MODE.load(Ordering::SeqCst) {
-        UPSTREAM_GIT_TIMEOUT
-    } else {
-        UPSTREAM_REQUEST_TIMEOUT
-    }
+    UPSTREAM_REQUEST_TIMEOUT
 }
 
 /// 对上游建立 TLS 连接(握手完成),供暖池预热与冷连路径共用。

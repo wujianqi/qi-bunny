@@ -18,10 +18,29 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(6);
 
-/// 采集全部四路候选(去重,并行):官方网段采样 + ipaddress.com + ip138
-/// + hackertarget。返回与 DNS 无关的候选 IP(IPv4 + IPv6)。
+/// 源质量分级(数值越小越优先):candidate_pool 截断(上限 48)时
+/// 头部候选优先参选,探测批也先测高质量源——历史解析库记录含大量
+/// 陈旧/跨服务 IP(如给 github.com 记过 GitHub Pages 的 Fastly 边缘
+/// 185.199.x.x),TLS 能通但不服务该域名,必须排在官方/hosts 库之后。
+const PRIO_OFFICIAL: u8 = 0; // meta API 官方网段 + 公共 hosts 库(带维护测速)
+const PRIO_DNS_LIKE: u8 = 1; // hackertarget 实时解析,视角互补
+const PRIO_HISTORY: u8 = 2; // ipaddress/ip138 历史解析,噪声最多
+
+fn source_prio(kind: &str, name: &str) -> u8 {
+    match kind {
+        "meta_api" | "hosts_list" => PRIO_OFFICIAL,
+        "hackertarget" => PRIO_DNS_LIKE,
+        "url_template" if name == "ip138" => PRIO_HISTORY,
+        "url_template" => PRIO_HISTORY, // ipaddress 等历史页同归历史级
+        _ => PRIO_HISTORY,
+    }
+}
+
+/// 采集全部候选(按源质量分级排序,去重):官方网段采样 + 公共 hosts 库
+/// + hackertarget + 历史解析库。返回与 DNS 无关的候选 IP(IPv4 + IPv6),
+/// 头部为高质量源,供候选池截断/探测批序优先消费。
 pub fn collect(domain: &str) -> Vec<String> {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<(u8, String)>();
     // 采集通道清单由 address.rs 的 IP_SOURCES 常量提供(地址集中
     // 管理),按 kind 分派:meta_api 走官方网段接口,url_template 把
     // {domain} 替换为目标域名后请求页面文本提取 IP。enabled=false
@@ -29,6 +48,7 @@ pub fn collect(domain: &str) -> Vec<String> {
     for src in crate::address::IP_SOURCES.iter().filter(|s| s.enabled).cloned() {
         let tx = tx.clone();
         let domain = domain.to_string();
+        let prio = source_prio(src.kind, src.name);
         thread::spawn(move || {
             let url = src.url.replace("{domain}", &domain);
             let ips = match src.kind {
@@ -40,7 +60,7 @@ pub fn collect(domain: &str) -> Vec<String> {
             };
             if let Some(ips) = ips {
                 for ip in ips {
-                    let _ = tx.send(ip);
+                    let _ = tx.send((prio, ip));
                 }
             }
         });
@@ -49,11 +69,18 @@ pub fn collect(domain: &str) -> Vec<String> {
     // 内置表):githubusercontent 系域名走 Fastly,官方 meta API 不覆盖,
     // 历史库也常缺失——静态网段是这类域名兜底可用性的关键通道
     for ip in from_known_ranges(domain) {
-        let _ = tx.send(ip);
+        let _ = tx.send((PRIO_OFFICIAL, ip));
     }
     drop(tx);
-    let set: HashSet<String> = rx.into_iter().collect();
-    set.into_iter().collect()
+    // 按源质量稳定排序 + 去重(保留先出现的高质量归属)
+    let mut tagged: Vec<(u8, String)> = rx.into_iter().collect();
+    tagged.sort_by_key(|(p, _)| *p);
+    let mut seen: HashSet<String> = HashSet::new();
+    tagged
+        .into_iter()
+        .filter(|(_, ip)| seen.insert(ip.clone()))
+        .map(|(_, ip)| ip)
+        .collect()
 }
 
 /// GitHub 官方 meta API:取 web/git 网段,每段采样一个代表地址(首地址+1,
@@ -275,9 +302,34 @@ fn extract_ips(text: &str) -> Vec<String> {
 ///   - git clone 前缀:     git clone https://github.com/u/r.git
 ///   - 中文冒号/引号包裹:  链接:「https://github.com/u/r」
 ///   - wget/curl 命令:     wget https://github.com/u/r/archive/main.zip
+///   - ssh 形态:           git@github.com:u/r.git
+///   - 仓库主页/深链:      https://github.com/u/r(/tree|/blob/...)
+///   - 省协议短链:         github.com/u/r/archive/main.zip
 ///
-/// 返回第一个匹配的 https GitHub 链接;找不到返回 None。
+/// 提取规则:优先取已含明确下载路径的完整 URL(raw/releases/codeload/
+/// objects/archive);没有则把仓库主页/blob/tree 深链「智能组合」为
+/// archive zip 下载链接;再不行对纯 `u/r` 仓库名组合 archive 链接。
+/// 返回第一个可下载的 https GitHub 链接;找不到返回 None。
 pub fn extract_github_url(text: &str) -> Option<String> {
+    let text = text.trim();
+    // 1) 文本里已有完整 https GitHub 链接(含 ssh/git@ 形态的兼容)
+    if let Some(url) = extract_https_url(text) {
+        return Some(url);
+    }
+    // 2) git@github.com:u/r.git 形态 -> 组合 archive 下载链接
+    if let Some(url) = from_ssh_form(text) {
+        return Some(url);
+    }
+    // 3) 省协议的 github.com/u/r/... 短链 -> 补 https:// 再走同一套规则
+    if let Some(rest) = short_form_path(text) {
+        let url = format!("https://{}", rest);
+        return to_downloadable(&url);
+    }
+    None
+}
+
+/// 从文本中提取第一个官方域的 https GitHub 链接,并归一为「可下载」链接
+fn extract_https_url(text: &str) -> Option<String> {
     // github.com / raw.githubusercontent.com / gist / codeload 等官方域
     const GITHUB_HOSTS: &[&str] = &[
         "https://github.com/",
@@ -286,7 +338,6 @@ pub fn extract_github_url(text: &str) -> Option<String> {
         "https://codeload.github.com/",
         "https://objects.githubusercontent.com/",
     ];
-    let text = text.trim();
     for host in GITHUB_HOSTS {
         let mut from = 0;
         while let Some(pos) = text[from..].find(host) {
@@ -300,12 +351,157 @@ pub fn extract_github_url(text: &str) -> Option<String> {
                 .unwrap_or(rest.len());
             let url = rest[..end].trim_end_matches(['.', ',', '、']);
             if url.len() > host.len() {
-                return Some(url.to_string());
+                return to_downloadable(url);
             }
             from = start + host.len();
         }
     }
     None
+}
+
+/// git@github.com:owner/repo(.git)? 形态 -> 仓库 archive zip 链接。
+/// 先按空白切开逐段匹配,容忍整段命令里混入其他参数。
+fn from_ssh_form(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        let word = word.trim_start_matches('(');
+        if let Some(rest) = word.strip_prefix("git@github.com:") {
+            let repo = rest
+                .trim_end_matches(['"', '\'', '」', '》', ')', '.', ',', '、'])
+                .trim_end_matches(".git");
+            if repo.matches('/').count() == 1 && !repo.contains(':') {
+                return Some(format!("https://github.com/{}/archive/refs/heads/main.zip", repo));
+            }
+        }
+    }
+    None
+}
+
+/// 省协议短链:github.com/... 或 www.github.com/... 开头的一行/一段。
+/// 返回 "github.com/..." 的其余部分(补 https 由调用方完成)。
+fn short_form_path(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        let word = word.trim_end_matches(['.', ',', '、', '"', '\'', ')']);
+        for prefix in ["www.github.com/", "github.com/"] {
+            if let Some(rest) = word.strip_prefix(prefix) {
+                if !rest.is_empty() {
+                    return Some(word.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 把任意 GitHub 链接归一为可直接下载的链接(智能分类):
+///   - raw.githubusercontent.com/...(/raw/...):文件下载,原样返回
+///   - /releases/download/... :Release 资产下载,原样返回
+///   - /releases/tag/<v> 或 /releases(无资产路径):转 tag 的 archive zip
+///   - /archive/...、codeload:Archive 下载,原样返回
+///   - gist.github.com/<u>/<id>(#文件名):转 gist zip;单文件走 raw 域
+///   - /blob/<branch>/<path>:单文件 -> raw.githubusercontent.com raw 链接
+///   - /tree/<branch>(/子目录):目录 -> 该分支 archive zip
+///   - 仓库主页 / xxx.git / git clone 链接:默认当 git 源码 -> main 分支
+///     archive zip(main 不存在时下载器会报 404 并回退直连,可接受)
+/// 转换失败(链路对不上仓库格式)返回 None。
+fn to_downloadable(url: &str) -> Option<String> {
+    // 已经是可直接下载的形态:raw 文件 / Release 资产 / Archive / codeload
+    const DIRECT: &[&str] = &[
+        "/raw/", "/releases/download/", "/archive/", "codeload.github.com",
+    ];
+    if DIRECT.iter().any(|s| url.contains(s)) {
+        return Some(url.to_string());
+    }
+    // raw / gist raw 域本身就是文件直链(host 里没有 "/raw/" 字样,需单独判)
+    if url.starts_with("https://raw.githubusercontent.com/")
+        || url.starts_with("https://gist.githubusercontent.com/")
+    {
+        return Some(url.to_string());
+    }
+    // objects.githubusercontent.com 是 Release 资产的真实存储域,直接下
+    if url.contains("objects.githubusercontent.com") {
+        return Some(url.to_string());
+    }
+    // gist.github.com/<user>/<id>[#file-名]:整包 zip;单文件转 raw 域
+    if let Some(rest) = url.strip_prefix("https://gist.github.com/") {
+        let (id_part, file) = match rest.split_once("#") {
+            Some((id, f)) => (id, Some(f)),
+            None => (rest, None),
+        };
+        // id_part = <user>/<gist_id>(可能带 / 后续段,取前两段)
+        let segs: Vec<&str> = id_part.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.len() >= 2 {
+            return match file {
+                // 单文件:https://gist.githubusercontent.com/<u>/<id>/raw/<file>
+                Some(f) => Some(format!(
+                    "https://gist.githubusercontent.com/{}/{}/raw/{}",
+                    segs[0], segs[1], f
+                )),
+                // 整包:codeload zip
+                None => Some(format!(
+                    "https://codeload.github.com/gist/{}/zip/{}",
+                    segs[0], segs[1]
+                )),
+            };
+        }
+        return None;
+    }
+    // ---- github.com/<owner>/<repo>[...] ----
+    let path = url.strip_prefix("https://github.com/")?;
+    let mut segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    // 去掉末尾 .git(git clone 链接形态)
+    let last = segs.len() - 1;
+    if segs[last].ends_with(".git") {
+        segs[last] = &segs[last][..segs[last].len() - 4];
+    }
+    let (owner, repo) = (segs[0], segs[1]);
+    // /blob/<branch>/<path...>:单文件 -> raw 链接(raw 域支持加速)
+    if segs.get(2) == Some(&"blob") {
+        if segs.len() >= 4 {
+            let file_path = segs[3..].join("/");
+            return Some(format!(
+                "https://raw.githubusercontent.com/{}/{}/{}",
+                owner, repo, file_path
+            ));
+        }
+        return None;
+    }
+    // 分支推断:/tree/<branch> 用显式分支;其余(主页/releases/tag)看下文
+    let branch_of = |b: &str| -> String {
+        // 分支名可能带 /,archive 只要第一段前的整段——GitHub 页面
+        // 对含 / 分支会拆多段,这里取 /tree/ 后所有段拼回(够用且不误伤 tag)
+        b.to_string()
+    };
+    if segs.get(2) == Some(&"tree") && segs.len() >= 4 {
+        let branch = branch_of(&segs[3..].join("/"));
+        return Some(format!(
+            "https://github.com/{}/{}/archive/refs/heads/{}.zip",
+            owner, repo, branch
+        ));
+    }
+    // /releases/tag/<tag>(可能 tag 含 /,取剩余全部段拼回)
+    if segs.get(2) == Some(&"releases") {
+        if segs.get(3) == Some(&"tag") && segs.len() >= 5 {
+            let tag = segs[4..].join("/");
+            return Some(format!(
+                "https://github.com/{}/{}/archive/refs/tags/{}.zip",
+                owner, repo, tag
+            ));
+        }
+        // /releases 或 /releases/latest:无具体资产,转 main 分支 archive
+        return Some(format!(
+            "https://github.com/{}/{}/archive/refs/heads/main.zip",
+            owner, repo
+        ));
+    }
+    // 仓库主页(无第三段)或其它未识别深链:默认按 git 源码需求,
+    // 转 main 分支 archive zip
+    Some(format!(
+        "https://github.com/{}/{}/archive/refs/heads/main.zip",
+        owner, repo
+    ))
 }
 
 /// 校验是否为可下载的 GitHub 资源链接(托盘/CLI 入口共用)
@@ -331,4 +527,47 @@ pub fn filename_from_url(github_url: &str) -> String {
     } else {
         seg.to_string()
     }
+}
+
+/// 定位系统下载目录:Windows 读资源管理器"下载"实际位置(注册表),
+/// 类 Unix 遵循 XDG_DOWNLOAD_DIR,兜底用户主目录下 Downloads;全部失败返回 None。
+pub fn default_download_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Ok(output) = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+                "/v",
+                "{374DE290-123F-4565-9164-39C4925E467B}",
+            ])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Some(idx) = line.find("REG_SZ") {
+                    let dir = line[idx + "REG_SZ".len()..].trim();
+                    if !dir.is_empty() {
+                        return Some(std::path::PathBuf::from(dir));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DOWNLOAD_DIR") {
+            let dir = xdg.trim_start_matches("$HOME/");
+            let p = std::path::PathBuf::from(dir);
+            if p.is_absolute() {
+                return Some(p);
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                return Some(std::path::PathBuf::from(home).join(p));
+            }
+        }
+    }
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|h| std::path::PathBuf::from(h).join("Downloads"))
 }

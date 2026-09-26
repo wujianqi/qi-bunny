@@ -2,10 +2,9 @@
 //!
 //! 控制台子系统程序,专为命令窗口下手动启动执行设计,与托盘模式完全独立:
 //!   qi-bunny-cli start    HTTPS 加速:测速后本机反代接管;关窗口/Ctrl+C 即取消
-//!   qi-bunny-cli stop     手动取消加速(移除 hosts/ssh config 标记块)
-//!   qi-bunny-cli git      代码库管理模式:SSH 转发,关窗口即还原
-//!   qi-bunny-cli status   查看加速是否开启(hosts / ssh config)
-//!   qi-bunny-cli clean    清理全部记录(hosts + ssh config)
+//!   qi-bunny-cli stop     手动取消加速(移除 hosts 标记块)
+//!   qi-bunny-cli status   查看加速是否开启(hosts)
+//!   qi-bunny-cli clean    清理全部记录(hosts)
 //!   qi-bunny-cli help     帮助(亦支持 -h/--help/-V/--version)
 //!
 //! 不带参数默认执行 start。
@@ -23,14 +22,14 @@ fn print_help() {
 子命令:
   start    HTTPS 加速:测速写入 hosts,本机反代接管(默认);
            前台驻留,关闭窗口/Ctrl+C 即取消
-  stop     手动取消加速:移除 hosts 标记块与 ssh config 标记块
-  git      代码库管理模式:SSH 本地转发承载 git push/pull,关闭窗口即还原
-  status   查看加速状态(hosts 是否写入 / ssh config 是否托管 / CA 信任状态)
+  stop     手动取消加速:移除 hosts 标记块
+  status   查看加速状态(hosts 是否写入 / CA 信任状态)
   cert     生成并安装本地 CA 根证书(MITM 加速模式需要,一次性;需管理员权限)
-  clean    清理全部记录(hosts 标记块 + ssh config 标记块)
-  fetch <链接> <保存路径>
+  clean    清理全部记录(hosts 标记块)
+  fetch <链接> [保存路径]
            第三方下载加速(候选手段):经公共中转源下载 GitHub
            单文件/Releases 资产/仓库 Archive,自动测速择优、逐源回退
+           省略保存路径时默认保存到系统下载目录
   help     显示本帮助
 
 全局选项:
@@ -65,7 +64,6 @@ fn main() {
         // ---- 子命令 ----
         Some("start") | None => start_run(),
         Some("stop") => stop_run(),
-        Some("git") => git_run(),
         Some("status") => status_run(),
         Some("cert") => cert_run(),
         Some("clean") => clean_run(),
@@ -103,33 +101,24 @@ fn cert_run() {
     }
 }
 
-/// 子命令 stop:手动取消加速(hosts + ssh config 一次清理)
+/// 子命令 stop:手动取消加速
 fn stop_run() {
-    let mut n = 0;
     if qi_bunny::hosts::remove_block() {
         println!("[+] 已移除 hosts 记录,HTTPS 加速已取消。");
-        n += 1;
-    }
-    if qi_bunny::ssh::disable_and_report() {
-        println!("[+] 已还原 ssh config,代码库管理模式已取消。");
-        n += 1;
-    }
-    if n == 0 {
+    } else {
         println!("[*] 当前未开启加速,无需操作。");
     }
 }
 
 /// 子命令 status:查看当前加速状态(只读)
-/// hosts/ssh 标记块反映"配置是否写入";反代候选池是**运行期内存态**,
+/// hosts 标记块反映"配置是否写入";反代候选池是**运行期内存态**,
 /// 只有本进程(或托盘进程)自己知道——status 作为独立进程读不到运行中
 /// 托盘的池子,因此池况仅在本进程托管反代时展示(如 start 驻留中另开
 /// 窗口查询);跨进程场景以 hosts 配置 + 实际连通性测试为准。
 fn status_run() {
     let hosts_on = qi_bunny::hosts::has_block();
-    let ssh_on = qi_bunny::ssh::has_config_block();
     println!("qi-bunny(奇小兔)v{}", env!("CARGO_PKG_VERSION"));
     println!("  HTTPS 加速(hosts):  {}", if hosts_on { "已开启" } else { "未开启" });
-    println!("  代码库管理(ssh config): {}", if ssh_on { "已开启" } else { "未开启" });
 
     // 反代与链路:与托盘状态行共用 status_detail(443 端口探测 + HTTP 链路实测)
     let (proxy_up, link) = qi_bunny::status_detail();
@@ -156,36 +145,21 @@ fn status_run() {
         qi_bunny::cert::TrustStatus::Unknown => "未知",
     };
     println!("  本地 CA(MITM): {}", trust_text);
-    println!(
-        "  Git 大库模式: {}",
-        if qi_bunny::proxy::git_mode_enabled() {
-            "已开启(大仓库 clone 读超时放宽至 5 分钟)"
-        } else {
-            "未开启(托盘菜单可开启)"
-        }
-    );
 }
 
-/// 子命令 clean:清理 hosts 与 ssh config 的全部标记块(含旧版残留)
+/// 子命令 clean:清理 hosts 标记块(含旧版残留)
 fn clean_run() {
-    let mut n = 0;
     if qi_bunny::hosts::remove_block() {
         println!("[+] 已移除 hosts 记录。");
-        n += 1;
-    }
-    if qi_bunny::ssh::disable_and_report() {
-        println!("[+] 已还原 ssh config(代码库管理模式配置)。");
-        n += 1;
-    }
-    if n == 0 {
+    } else {
         println!("[*] 未发现本工具的记录,无需清理。");
     }
 }
 
 /// 子命令 fetch:第三方中转源下载加速(候选手段,与 hosts 加速完全隔离)
 fn fetch_run(args: &[String]) {
-    if args.len() != 2 {
-        eprintln!("[!] 用法: qi-bunny-cli fetch <GitHub链接> <保存路径>\n");
+    if args.is_empty() || args.len() > 2 {
+        eprintln!("[!] 用法: qi-bunny-cli fetch <GitHub链接> [保存路径]\n");
         std::process::exit(2);
     }
     // 链接参数兼容整段命令(git clone … / wget …),先提取出 GitHub 链接
@@ -196,56 +170,24 @@ fn fetch_run(args: &[String]) {
             std::process::exit(2);
         }
     };
-    let dest = std::path::PathBuf::from(&args[1]);
-    match qi_bunny::mirror::download(&url, &dest) {
+    // 保存路径可选:省略时默认保存到系统下载目录(文件名取自 URL 路径末段)
+    let dest = match args.get(1) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let dir = match qi_bunny::sources::default_download_dir() {
+                Some(d) => d,
+                None => {
+                    eprintln!("[!] 无法定位系统下载目录,请显式指定保存路径\n");
+                    std::process::exit(2);
+                }
+            };
+            dir.join(qi_bunny::sources::filename_from_url(&url))
+        }
+    };
+    match qi_bunny::mirror::download(&url, &dest, &mut |_| {}) {
         Ok(label) => println!("[+] 下载完成: {} -> {}", label, dest.display()),
         Err(e) => {
             eprintln!("[!] {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// 代码库管理模式(CLI 前台):开启 SSH 转发,验证后驻留,退出时还原
-fn git_run() {
-    println!(
-        "qi-bunny(奇小兔)v{} —— 代码库管理模式(SSH 本地转发)
-仅供个人学习、技术研究与辅助 AI 智能体开发使用,严禁用于非法用途。
-",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!("开启后 git push/pull(git@github.com) 走加速链路;关闭本程序自动还原。\n");
-
-    println!("[*] 收集 github.com 候选 IP…");
-    let pool = qi_bunny::candidate_pool("github.com");
-    match qi_bunny::ssh::enable_ssh(&pool) {
-        Ok(mode) => {
-            println!("[+] 代码库管理模式{}", mode);
-            let (ok, msg) = qi_bunny::ssh::verify();
-            if ok {
-                println!("[+] SSH 链路验证通过:{}", msg);
-                println!("[+] 现在可以 git push / git pull 了。");
-            } else {
-                println!("[!] SSH 链路验证未通过:{},可重试或检查 ssh key。", msg);
-            }
-            println!("[+] 保持本窗口开启;关闭即自动还原配置取消提交加速。");
-
-            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-            {
-                let running = running.clone();
-                ctrlc::set_handler(move || {
-                    running.store(false, Ordering::SeqCst);
-                })
-                .ok();
-            }
-            while running.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            qi_bunny::ssh::disable_ssh();
-            println!("[+] 已还原 ssh config,代码库管理模式已取消。");
-        }
-        Err(e) => {
-            eprintln!("[!] 开启失败:{}", e);
             std::process::exit(1);
         }
     }

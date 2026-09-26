@@ -6,16 +6,17 @@ license = "GPL-3.0"
 description = "奇小兔(qi-bunny)—— AI 智能体开发辅助工具:开源库的搜索与更新加速"
 
 # GitHub 网络加速命令行工具(仅用于辅助软件开发、学习使用)
-# 机制:hosts 加速(HTTPS)+ SSH 本地转发(代码库管理)
+# 机制:hosts 加速(HTTPS),本机 SNI 反向代理端到端透传
 # 结构:共享逻辑在 src/lib.rs,两个独立二进制彻底分离托盘与命令行模式:
 #   dns.rs            <- DoH/UDP 双路域名解析
 #   hosts.rs          <- hosts 标记块托管
 #   probe.rs          <- 真实 TLS 握手测速择优
 #   sources.rs        <- 多通道候选 IP 采集
-#   ssh.rs            <- 代码库管理模式(SSH 转发)
+#   mirror.rs         <- 第三方下载加速(中转源测速择优/逐源回退)
+#   address.rs        <- 源头地址常量(IP 源头/加速中转源)
 #   tray.rs           <- 托盘后台模式(图标即状态)
 #   bin/qi_bunny.rs     托盘入口(GUI 子系统,从启动起无控制台窗口,不闪黑窗)
-#   bin/qi_bunny_cli.rs 命令行入口(cli/git/clean,控制台子系统)
+#   bin/qi_bunny_cli.rs 命令行入口(start/fetch/clean,控制台子系统)
 
 [lib]
 name = "qi_bunny"
@@ -53,6 +54,13 @@ windows-sys = { version = "0.59", features = [
 ] }
 # GitHub logo(SVG)渲染为托盘图标
 resvg = "0.42"
+# 下载完成/失败系统 Toast 通知(复用 tao 已编译进依赖树的 windows crate;
+# 仅加 UI_Notifications / Data_Xml 两个特性,不引入新 crate)
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "UI_Notifications",
+    "Data_Xml_Dom",
+] }
 
 [profile.release]
 opt-level = "z"     # 体积优先优化

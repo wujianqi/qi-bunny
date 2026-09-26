@@ -144,6 +144,10 @@ fn probe_once(domain: &str, ip: &str) -> Option<u128> {
         "Whoa there!",
         "has been restricted",
         "antispam",
+        // Fastly 边缘节点(185.199.x.x,GitHub Pages CDN)持有 *.github.com
+        // 通配符证书,TLS 能通;但对非 Pages 域名返回 "unknown domain" 错误页
+        // (404/421,不是 403)——上面的状态码过滤拦不住它,必须按内容剔除
+        "Fastly error: unknown domain",
     ];
     if BLOCK_MARKS.iter().any(|m| head.contains(m)) {
         eprintln!("[!] {} 返回拦截页(伪装 {:?}),已剔除", ip, status);

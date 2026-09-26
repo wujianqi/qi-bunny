@@ -149,8 +149,10 @@ pub enum TrustStatus {
 }
 
 /// 检查本工具 CA 是否已被系统信任(Windows:用 certutil 枚举 Root 库,
-/// 按证书主体 CN 匹配;避免直接依赖 Crypto API 的复杂绑定)。
-/// 任何一步失败都按 Missing 处理——宁可多提示一次安装,不误报"已信任"。
+/// 按 CN + SHA1 指纹匹配——只匹配 CN 会把"旧 CA 残留"(同 CN、不同密钥,
+/// 删目录重装/CA 重新生成后常见)误判为已信任,导致叶子证书校验全挂;
+/// 本地 CA 文件与信任库中那张指纹一致才算 Trusted)。
+/// 任何一步失败都按 Missing 处理——宁可重装一次,不误报"已信任"。
 pub fn ca_trust_status() -> TrustStatus {
     #[cfg(windows)]
     {
@@ -158,20 +160,17 @@ pub fn ca_trust_status() -> TrustStatus {
         if !ca_cert_path().exists() {
             return TrustStatus::Missing;
         }
+        // 本地 CA 的 SHA1 指纹(certutil -hashfile 输出十六进制,去空格比对)
+        let Some(fingerprint) = local_ca_fingerprint() else {
+            return TrustStatus::Missing;
+        };
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let ok = std::process::Command::new("certutil")
-            .args(["-store", "Root"])
+            .args(["-verifystore", "Root", &fingerprint])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
-            .map(|o| {
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                text.contains("qi-bunny Local CA")
-            })
+            .map(|o| o.status.success())
             .unwrap_or(false);
         if ok {
             TrustStatus::Trusted
@@ -185,12 +184,44 @@ pub fn ca_trust_status() -> TrustStatus {
     }
 }
 
-/// 引导安装 CA 到系统受信任根(Windows:certutil -addstore -f Root <pem>)。
+/// 本地 CA 证书文件的 SHA1 指纹(小写十六进制,无分隔)
+#[cfg(windows)]
+fn local_ca_fingerprint() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("certutil")
+        .args(["-hashfile", ca_cert_path().to_str()?, "SHA1"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    // 输出第 2 行(索引 1)是纯十六进制指纹,首尾可能有空格
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().nth(1).map(|l| l.trim().to_ascii_lowercase())
+}
+
+/// 删除系统受信任根中所有同 CN("qi-bunny Local CA")的旧证书:
+/// 覆盖安装前清理,避免旧指纹残留后 verifystore 命中旧证书造成误判,
+/// 也减少信任库里的僵尸条目。按 CN 硬编码匹配与 ca_params() 保持一致。
+#[cfg(windows)]
+fn remove_old_cas() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // certutil -delstore Root <CN> 只删完全匹配该 CN 的条目;旧版本若
+    // 改过 CN,这里会漏删——可接受:老 CN 证书不再被本工具引用,只是残留
+    let _ = std::process::Command::new("certutil")
+        .args(["-delstore", "Root", "qi-bunny Local CA"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+/// 引导安装 CA 到系统受信任根(Windows:先删同 CN 旧证书再 certutil
+/// -addstore -f Root <pem> 强制覆盖,确保信任库中始终只有当前密钥的 CA)。
 /// 返回 Ok(()) 或失败说明;调用方在 UI/命令行展示结果。
 pub fn install_ca_to_trust() -> Result<(), String> {
     #[cfg(windows)]
     {
         let cert_path = ca_cert_path();
+        remove_old_cas();
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let out = std::process::Command::new("certutil")

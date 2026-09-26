@@ -8,9 +8,7 @@
 //! 事件循环(tao)运行在主线程,这是 tray-icon 在 Windows 上的要求。
 
 use crate::{disable_proxy, enable_proxy, logerr, QUIET};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use tao::event::Event;
 use tao::event_loop::EventLoopBuilder;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -42,10 +40,6 @@ enum Cmd {
     /// 开启(自动先清理旧记录,再重新测速写入;同时充当"重新测速并刷新")
     Enable,
     Disable,
-    /// 代码库管理模式开关(true=开启 SSH 转发,false=关闭并还原)
-    SshSet(bool),
-    /// Git 大库模式开关(true=放宽上游超时专治大仓库 clone,false=恢复)
-    GitModeSet(bool),
     Quit,
 }
 
@@ -53,8 +47,8 @@ enum Cmd {
 enum UserEvent {
     /// HTTPS 代理状态:(是否已开启, 状态描述)
     Status(bool, String),
-    /// 代码库管理模式状态:(是否已开启, 状态描述)
-    SshStatus(bool, String),
+    /// 加速下载进度/结果:None = 下载结束(恢复菜单),Some = 进行中的文案
+    Download(Option<String>),
 }
 
 pub fn run() {
@@ -86,28 +80,22 @@ pub fn run() {
     }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    // 恢复上次的 Git 大库模式开关(持久化在 exe 同目录)
-    crate::proxy::load_git_mode();
-    let git_on = crate::proxy::git_mode_enabled();
     let proxy = event_loop.create_proxy();
 
-    // 菜单:状态行(只读)+ 开启/关闭/刷新 + 代码库管理模式(勾选) + 关于 + 退出
+    // 菜单:状态行(只读)+ 开启/关闭/刷新 + 加速下载 + 关于 + 退出
     let status = MenuItem::new("状态: 初始化…", false, None);
     let enable = MenuItem::new("开启代理", true, None);
     let disable = MenuItem::new("关闭代理", false, None);
     let refresh = MenuItem::new("重新测速并刷新", true, None);
-    let ssh_mode = tray_icon::menu::CheckMenuItem::new("代码库管理模式(git)", false, true, None);
-    // Git 大库模式:默认关,手动开启后放宽上游读超时专治大仓库 clone 断流
-    let git_mode = tray_icon::menu::CheckMenuItem::new("Git 大库模式(大仓库 clone 加速)", git_on, true, None);
-    // 第三方下载加速(候选手段):链接取自剪贴板,与 hosts 加速完全隔离
+    // 第三方下载加速(候选手段):链接取自剪贴板,与 hosts 加速完全隔离;
+    // 下方只读行展示下载进度,下载中禁用「加速下载」防止并发下载互相覆盖
     let fetch = MenuItem::new("加速下载(链接取自剪贴板)", true, None);
+    let dl_status = MenuItem::new("加速下载: 空闲", false, None);
     let about = MenuItem::new("关于 qi-bunny…", true, None);
     let quit = MenuItem::new("退出(自动取消代理)", true, None);
     let enable_id = enable.id().clone();
     let disable_id = disable.id().clone();
     let refresh_id = refresh.id().clone();
-    let ssh_id = ssh_mode.id().clone();
-    let git_id = git_mode.id().clone();
     let fetch_id = fetch.id().clone();
     let about_id = about.id().clone();
     let quit_id = quit.id().clone();
@@ -120,10 +108,8 @@ pub fn run() {
         &disable,
         &refresh,
         &PredefinedMenuItem::separator(),
-        &ssh_mode,
-        &git_mode,
-        &PredefinedMenuItem::separator(),
         &fetch,
+        &dl_status,
         &PredefinedMenuItem::separator(),
         &about,
         &quit,
@@ -148,13 +134,8 @@ pub fn run() {
     // 工作线程:执行耗时的解析+测速+写 hosts,完成后回传状态;
     // 空闲时定期自检,加速链路失效时自动重新测速恢复
     let (tx, rx) = mpsc::channel::<Cmd>();
-    // 代码库管理模式当前状态(菜单事件线程翻转勾选项用)
-    let ssh_on = Arc::new(AtomicBool::new(false));
-    // Git 大库模式当前状态(菜单点击翻转,与持久化文件保持一致)
-    let git_on_state = Arc::new(AtomicBool::new(crate::proxy::git_mode_enabled()));
     {
         let proxy = proxy.clone();
-        let ssh_on = ssh_on.clone();
         std::thread::spawn(move || {
             // 自检周期:5 分钟;recv_timeout 空闲等待期间做自检
             let check_interval = std::time::Duration::from_secs(300);
@@ -211,43 +192,9 @@ pub fn run() {
                             proxy_on = false;
                             let _ = proxy.send_event(UserEvent::Status(false, "已关闭".into()));
                         }
-                        Cmd::SshSet(on) => {
-                            if on {
-                                // 复用 HTTPS 代理的 github.com 候选池
-                                let pool = crate::candidate_pool("github.com");
-                                match crate::ssh::enable_ssh(&pool) {
-                                    Ok(mode) => {
-                                        ssh_on.store(true, Ordering::SeqCst);
-                                        let _ = proxy.send_event(UserEvent::SshStatus(
-                                            true,
-                                            format!("已开启({})", mode),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        ssh_on.store(false, Ordering::SeqCst);
-                                        let _ = proxy.send_event(UserEvent::SshStatus(
-                                            false,
-                                            format!("开启失败:{}", e),
-                                        ));
-                                    }
-                                }
-                            } else {
-                                crate::ssh::disable_ssh();
-                                ssh_on.store(false, Ordering::SeqCst);
-                                let _ = proxy.send_event(UserEvent::SshStatus(
-                                    false,
-                                    "已关闭".into(),
-                                ));
-                            }
-                        }
-                        Cmd::GitModeSet(on) => {
-                            // 开关即时生效(转发层每请求读开关),无需重启反代
-                            crate::proxy::set_git_mode(on);
-                        }
                         Cmd::Quit => {
-                            // 退出前确保取消代理与代码库管理模式
+                            // 退出前取消代理
                             disable_proxy();
-                            crate::ssh::disable_ssh();
                             std::process::exit(0);
                         }
                     },
@@ -286,10 +233,8 @@ pub fn run() {
     // 启动时代理由工作线程直接测速写入 hosts
 
     // 托盘菜单事件 -> 工作线程(独立线程收全局菜单事件通道)
-    // CheckMenuItem 点击即翻转勾选,按当前 ssh_on 状态取反下发
     {
         let menu_tx = tx.clone();
-        let ssh_on = ssh_on.clone();
         std::thread::spawn(move || {
             let menu_rx = MenuEvent::receiver();
             while let Ok(ev) = menu_rx.recv() {
@@ -299,17 +244,8 @@ pub fn run() {
                     let _ = menu_tx.send(Cmd::Disable);
                 } else if ev.id == refresh_id {
                     let _ = menu_tx.send(Cmd::Enable);
-                } else if ev.id == ssh_id {
-                    let on = !ssh_on.load(Ordering::SeqCst);
-                    let _ = menu_tx.send(Cmd::SshSet(on));
-                } else if ev.id == git_id {
-                    // CheckMenuItem 非 Send,不能跨线程读勾选状态:
-                    // 用原子布尔镜像(点击即取反),按下一次状态下发
-                    let on = !git_on_state.load(Ordering::SeqCst);
-                    git_on_state.store(on, Ordering::SeqCst);
-                    let _ = menu_tx.send(Cmd::GitModeSet(on));
                 } else if ev.id == fetch_id {
-                    fetch_from_clipboard();
+                    fetch_from_clipboard(proxy.clone());
                 } else if ev.id == about_id {
                     show_about();
                 } else if ev.id == quit_id {
@@ -340,11 +276,15 @@ pub fn run() {
                 };
                 let _ = tray.set_tooltip(Some(tip.to_string()));
             }
-            Event::UserEvent(UserEvent::SshStatus(on, msg)) => {
-                // 代码库管理模式:同步勾选状态与状态行
-                ssh_mode.set_checked(on);
-                status.set_text(format!("提交: {}", msg));
-            }
+            Event::UserEvent(UserEvent::Download(msg)) => match msg {
+                // 进行中:显示进度并禁用「加速下载」,防止并发下载互相覆盖文件
+                Some(text) => {
+                    dl_status.set_text(text);
+                    fetch.set_enabled(false);
+                }
+                // 结束(无论成败):状态行保留结果文案,恢复「加速下载」可点击
+                None => fetch.set_enabled(true),
+            },
             _ => {}
         }
     });
@@ -410,12 +350,36 @@ fn message_box(title: &str, text: &str, is_error: bool) {
 
 /// 托盘「加速下载」:链接取自剪贴板,存入系统下载目录,完成后弹窗通知。
 /// 第三方中转下载是候选手段,与 hosts/反代主链路完全隔离,失败不影响加速。
-fn fetch_from_clipboard() {
+/// 下载期间通过 Download 事件实时刷新菜单状态行(百分比/阶段),
+/// 并禁用「加速下载」项,直到本次下载结束(无论成败)才恢复可点击。
+fn fetch_from_clipboard(proxy: tao::event_loop::EventLoopProxy<UserEvent>) {
     // 独立线程执行:下载含测速可能耗时数十秒,不能卡住菜单事件线程
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
+        // 进度快照 -> 菜单文案:有总大小显示百分比,否则显示已下载字节数
+        let mut send = |p: &crate::mirror::Progress| {
+            let text = if p.total > 0 {
+                format!(
+                    "加速下载: {} {:.1}%",
+                    p.stage,
+                    (p.done as f64 / p.total as f64 * 100.0).min(100.0)
+                )
+            } else if p.done > 0 {
+                format!("加速下载: {} {:.1} MB", p.stage, p.done as f64 / 1048576.0)
+            } else {
+                format!("加速下载: {}", p.stage)
+            };
+            let _ = proxy.send_event(UserEvent::Download(Some(text)));
+        };
+
+        let finish = |text: &str, proxy: &tao::event_loop::EventLoopProxy<UserEvent>| {
+            let _ = proxy.send_event(UserEvent::Download(Some(text.to_string())));
+            let _ = proxy.send_event(UserEvent::Download(None));
+        };
+
         let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(t) => t,
             Err(e) => {
+                finish(&format!("加速下载: 读剪贴板失败"), &proxy);
                 message_box("加速下载", &format!("读取剪贴板失败:{}", e), true);
                 return;
             }
@@ -425,6 +389,7 @@ fn fetch_from_clipboard() {
         let url = match crate::sources::extract_github_url(&text) {
             Some(u) => u,
             None => {
+                finish("加速下载: 未找到链接", &proxy);
                 message_box(
                     "加速下载",
                     "未在剪贴板中找到 GitHub 链接。请复制 GitHub 文件/Release/Archive 链接(支持整段 git clone 命令)再点击。",
@@ -434,21 +399,28 @@ fn fetch_from_clipboard() {
             }
         };
         if let Err(e) = crate::sources::validate_url(&url) {
+            finish("加速下载: 链接无效", &proxy);
             message_box("加速下载", &format!("链接无效:{}", e), true);
             return;
         }
         // 保存到系统下载目录(取不到则退回当前目录)
-        let dir = std::env::var("USERPROFILE")
-            .map(|h| std::path::PathBuf::from(h).join("Downloads"))
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let dir = crate::sources::default_download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let dest = dir.join(crate::sources::filename_from_url(&url));
-        match crate::mirror::download(&url, &dest) {
-            Ok(label) => message_box(
-                "加速下载完成",
-                &format!("已保存:{}\n使用通道:{}", dest.display(), label),
-                false,
-            ),
-            Err(e) => message_box("加速下载失败", &e, true),
+        match crate::mirror::download(&url, &dest, &mut send) {
+            Ok(label) => {
+                finish("加速下载: ✅ 完成", &proxy);
+                let body = format!("已保存:{}\n使用通道:{}", dest.display(), label);
+                // Toast 优先(不挡操作);失败退回 MessageBox 保证结果可见
+                if !crate::notify::toast("加速下载完成", &body) {
+                    message_box("加速下载完成", &body, false);
+                }
+            }
+            Err(e) => {
+                finish("加速下载: ❌ 失败", &proxy);
+                if !crate::notify::toast("加速下载失败", &e) {
+                    message_box("加速下载失败", &e, true);
+                }
+            }
         }
     });
 }

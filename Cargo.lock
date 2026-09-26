@@ -1711,6 +1711,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "webpki-roots 0.26.11",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

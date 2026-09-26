@@ -120,24 +120,48 @@ pub fn filename_from_url(github_url: &str) -> String {
     }
 }
 
+/// 进度回调收到的快照:已写入字节 / 总字节(0 = 总大小未知)/ 阶段说明
+#[derive(Clone, Debug)]
+pub struct Progress {
+    pub done: u64,
+    pub total: u64,
+    /// 当前阶段:如"正在测速中转源""正在下载"“正在尝试 <源标签>”
+    pub stage: String,
+}
+
 /// 经第三方中转源下载 `github_url` 到 `dest` 路径。
 /// `github_url` 需为完整 https 链接,支持:
 ///   - 单文件:  https://raw.githubusercontent.com/user/repo/main/path
 ///   - Release: https://github.com/user/repo/releases/download/v1.0/x.zip
 ///   - Archive: https://github.com/user/repo/archive/refs/heads/main.zip
 ///
-/// 成功返回实际使用的源标签;全部失败返回 Err(最后一次错误)。
-pub fn download(github_url: &str, dest: &std::path::Path) -> Result<String, String> {
+/// `on_progress` 在测速/切换源/每块写入后被调用(可为空操作),供 UI
+/// 展示实时进度。成功返回实际使用的源标签;全部失败返回 Err(最后错误)。
+pub fn download(
+    github_url: &str,
+    dest: &std::path::Path,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> Result<String, String> {
     if !github_url.starts_with("https://") || !github_url.contains("github") {
         return Err(format!("仅支持 GitHub 资源链接,收到: {}", github_url));
     }
+    on_progress(&Progress {
+        done: 0,
+        total: 0,
+        stage: "正在测速中转源…".into(),
+    });
     let list = candidates(github_url);
     let mut last_err = String::new();
     for (url, label) in &list {
         print!("[*] 尝试 {} … ", label);
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        match fetch_to_file(url, dest) {
+        on_progress(&Progress {
+            done: 0,
+            total: 0,
+            stage: format!("正在尝试 {}", label),
+        });
+        match fetch_to_file(url, dest, on_progress) {
             Ok(bytes) => {
                 println!("成功 ({} 字节)", bytes);
                 return Ok(label.clone());
@@ -152,8 +176,13 @@ pub fn download(github_url: &str, dest: &std::path::Path) -> Result<String, Stri
     Err(format!("全部 {} 个下载通道均失败,最后错误: {}", list.len(), last_err))
 }
 
-/// 单次下载:流式写盘,避免大文件占内存;返回写入字节数
-fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<u64, String> {
+/// 单次下载:流式写盘,避免大文件占内存;返回写入字节数。
+/// 每 256KB 或读满一段调用一次进度回调(total 取 Content-Length,拿不到为 0)。
+fn fetch_to_file(
+    url: &str,
+    dest: &std::path::Path,
+    on_progress: &mut dyn FnMut(&Progress),
+) -> Result<u64, String> {
     let resp = ureq::get(url)
         .timeout(CONNECT_TIMEOUT)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -162,25 +191,39 @@ fn fetch_to_file(url: &str, dest: &std::path::Path) -> Result<u64, String> {
     if resp.status() != 200 {
         return Err(format!("HTTP {}", resp.status()));
     }
+    let total = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(dest).map_err(|e| format!("创建文件失败: {}", e))?;
     let mut buf = [0u8; 64 * 1024];
-    let mut total: u64 = 0;
+    let mut total_written: u64 = 0;
+    let mut last_report: u64 = 0;
     loop {
         let n = reader.read(&mut buf).map_err(|e| format!("读取中断: {}", e))?;
         if n == 0 {
             break;
         }
         file.write_all(&buf[..n]).map_err(|e| format!("写入失败: {}", e))?;
-        total += n as u64;
+        total_written += n as u64;
+        // 回调开销极小(无锁、无 IO),每 256KB 报一次足够顺滑且不拖慢下载
+        if total_written - last_report >= 256 * 1024 {
+            last_report = total_written;
+            on_progress(&Progress {
+                done: total_written,
+                total,
+                stage: "正在下载".into(),
+            });
+        }
     }
     // 中转站常见故障:返回 200 但内容是几行错误文本。小于 1KB 时
     // 交给调用方按"疑似失败"处理不可靠,这里直接校验非空即可,
     // 具体内容由调用方按需使用。
-    if total == 0 {
+    if total_written == 0 {
         return Err("响应为空".to_string());
     }
-    Ok(total)
+    Ok(total_written)
 }
 
 /// 打印当前中转源测速榜(供 status/诊断用,只读,不写任何状态)
